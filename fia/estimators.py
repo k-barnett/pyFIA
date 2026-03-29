@@ -18,6 +18,23 @@ def _basal_area(diameter_in: pd.Series) -> pd.Series:
     return diameter_in * diameter_in.abs() * 0.005454
 
 
+def _tpa_size_class_breakpoints(cutoffs: Sequence[float]) -> list[float]:
+    """
+    Validate and return sorted unique diameter breakpoints (inches) for ``tpa``.
+
+    Bins are half-open ``[L, U)``: ``[0, b0)``, ``[b0, b1)``, …, ``[b_{n-1}, inf)``.
+    """
+    edges = sorted({float(x) for x in cutoffs})
+    if not edges:
+        raise ValueError("by_size_class requires at least one cutoff diameter (inches).")
+    if any(e <= 0 for e in edges):
+        raise ValueError("by_size_class cutoffs must be positive.")
+    for i in range(len(edges) - 1):
+        if edges[i] >= edges[i + 1]:
+            raise ValueError("by_size_class cutoffs must be strictly increasing.")
+    return edges
+
+
 def _land_type_domain(
     land_type: str,
     cond_status_cd: pd.Series,
@@ -1256,13 +1273,25 @@ def tpa(
     land_type: str = "forest",
     tree_type: str = "live",
     by_species: bool = False,
-    by_size_class: bool = False,
+    by_size_class: Optional[Sequence[float]] = None,
     by_plot: bool = False,
     tree_list: bool = False,
 ) -> pd.DataFrame:
     """
     Estimate tree abundance (TPA) and basal area (BAA) using a simplified
     plot‑level estimator.
+
+    Parameters
+    ----------
+    by_size_class:
+        If ``None``, do not stratify by diameter class. Otherwise a non-empty
+        sequence of **positive, strictly increasing** diameter breakpoints in
+        inches. With *k* values there are **k + 1** bins: ``[0, c0)``,
+        ``[c0, c1)``, …, ``[c_{k-2}, c_{k-1})``, and ``[c_{k-1}, ∞)`` — the
+        **last bin includes all diameters ≥ the largest cutoff**. Finite bins
+        are left-closed and right-open; ``sizeClass`` stores pandas
+        ``Interval`` values. Example: ``(2, 4, 6, 8)`` → ``[0, 2)``,
+        ``[2, 4)``, ``[4, 6)``, ``[6, 8)``, ``[8, inf)``.
 
     Notes
     -----
@@ -1351,15 +1380,20 @@ def tpa(
                 grp_by.append("SPCD")
 
     # Size class information -------------------------------------------------
-    if by_size_class:
+    if by_size_class is not None:
         if "DIA" not in tree.columns:
             raise ValueError(
-                "`TREE` table must contain 'DIA' when by_size_class=True."
+                "`TREE` table must contain 'DIA' when by_size_class is set."
             )
-        # 2-inch size classes, indexed as odd integers: 1, 3, 5, ...
-        dia = tree["DIA"].where(tree["DIA"] > 0)
-        size_class = (dia // 2).astype("Int64") * 2 + 1
-        tree["sizeClass"] = size_class
+        edges = _tpa_size_class_breakpoints(by_size_class)
+        bins = [0.0] + edges + [float("inf")]
+        dia_num = pd.to_numeric(tree["DIA"], errors="coerce")
+        tree["sizeClass"] = pd.cut(
+            dia_num,
+            bins=bins,
+            right=False,
+            include_lowest=True,
+        )
         if "sizeClass" not in grp_by:
             grp_by.append("sizeClass")
 

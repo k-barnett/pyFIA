@@ -1,6 +1,6 @@
 ## FIA (Python)
 
-`fia_py` is an in-progress Python port of the R package [`rFIA`](https://github.com/doserjef/rFIA), providing a user-friendly interface to the USFS Forest Inventory and Analysis (FIA) Database.
+`pyFIA` is an in-progress Python port of the R package [`rFIA`](https://github.com/doserjef/rFIA), providing a user-friendly interface to the USFS Forest Inventory and Analysis (FIA) Database.
 
 The goal is to mirror the core public API of `rFIA` while adopting Pythonic conventions and the scientific Python stack (e.g., `pandas`).
 
@@ -81,7 +81,7 @@ tpa(
     land_type="forest",
     tree_type="live",
     by_species=False,
-    by_size_class=False,
+    by_size_class=None,
     by_plot=False,
     tree_list=False,
 )
@@ -90,7 +90,7 @@ tpa(
 - **`land_type`**: `"forest"`, `"timber"`, `"all"` (domain via **`COND_STATUS_CD`**, **`SITECLCD`**, **`RESERVCD`**).
 - **`tree_type`**: `"live"`, `"dead"`, `"gs"`, `"all"`.
 - **`by_species=True`**: groups by species (**`SPECIES`** table when available; else **`SPCD`**).
-- **`by_size_class=True`**: 2-inch **`sizeClass`** groups (odd integers: 1, 3, 5, …).
+- **`by_size_class`**: ``None`` (default) skips diameter classes; otherwise a **non-empty list/tuple of inch breakpoints** (positive, strictly increasing). With *k* cutoffs you get **k + 1** half-open bins: ``[0, c0)``, ``[c0, c1)``, …, ``[c_{k-2}, c_{k-1})``, and a **final open-ended bin** ``[c_{k-1}, ∞)`` (trees at or above the largest cutoff go here). Column **`sizeClass`** uses pandas **`Interval`** labels. Example: ``(2, 4, 6, 8)`` → five bins: 0–2, 2–4, 4–6, 6–8, and 8–∞.
 - **`by_plot=True`**: per-plot **`TPA`**, **`BAA`**, **`PROP_FOREST`**.
 - **`tree_list=True`**: per-tree rows with **`PLT_CN`**, **`CONDID`**, **`SUBP`**, **`TREE`**, **`YEAR`**, **`TPA`**, **`BAA`**, **`PROP_FOREST`** (and related columns as implemented).
 
