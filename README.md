@@ -157,7 +157,7 @@ Tests use **`pytest`**.
 | Location | What it covers | Network / data |
 |----------|----------------|------------------|
 | **`tests/test_custom_pse_area_match.py`** | **`custom_pse`** **`PROP_FOREST_TOTAL`** vs **`area`** **`AREA_TOTAL`** by **`ADFORCD`** on bundled **AZ** FIADB | **No network**; requires **`tests/fiadb/AZ/`** CSVs |
-| **`tests/test_rfia_montana.py`** | **`tpa`**: tree-list columns + **FIADB-API** check (**`snum=1004`**, ``BA_TOTAL`` within **1%** relative error of API); **`area(cond_list=True)`**; **`custom_pse`**; **`area`** vs **FIADB-API** forest acres (**`snum=2`**, integer-rounded match) | **Bundled FIADB**: **`tests/fiadb/mt`** or **`tests/fiadb/MT`**. **FIADB-API** needs network for API-backed tests |
+| **`tests/test_rfia_montana.py`** | **`tpa`**: tree-list columns + **FIADB-API** check (**`snum=1004`**, ``BA_TOTAL`` within **1%** relative error of API); **`area(cond_list=True)`**; **`custom_pse`**; **`area`** vs **FIADB-API** forest acres (**`snum=2`**, integer-rounded match) | **FIADB**: place a Montana extract under **`tests/fiadb/MT/`** locally (that tree is **`.gitignore`d**—files exceed GitHub’s size limit). **FIADB-API** needs network for API-backed tests |
 | **`tests/test_area.py`**, **`tests/test_mog_area.py`**, **`tests/test_mog.py`**, **`tests/validation_figure.py`** | Example / exploratory scripts (not necessarily collected by **`pytest`**) | Local **`tests/fiadb/...`** as referenced in each script |
 
 Run everything:
@@ -173,6 +173,8 @@ pytest tests/test_custom_pse_area_match.py
 ```
 
 Montana integration tests are marked **`@pytest.mark.integration`**; you can select or deselect them with **`pytest -m integration`** or **`-m "not integration"`** (markers are registered in **`pyproject.toml`**).
+
+**Large MOG assets not in git:** **`mog_auxillary/utility_R5_PAZ.tif`** (PAZ raster for Pacific Northwest) is also **`.gitignore`d** for the same reason. Keep it next to the other **`mog_auxillary/`** layers on disk, or use **Git LFS** / release downloads if you need it in a shared checkout.
 
 ### Dependencies
 
