@@ -1,0 +1,441 @@
+from __future__ import annotations
+
+import shutil
+import tempfile
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Dict, Iterable, List, Mapping, Optional, Sequence
+
+import pandas as pd
+import requests
+from tqdm import tqdm
+
+
+FIA_BASE_URL = "https://apps.fs.usda.gov/fia/datamart/CSV"
+
+# List of known table names, ported from rFIA::getFIA
+KNOWN_TABLES: List[str] = [
+    "BOUNDARY",
+    "COND_DWM_CALC",
+    "COND",
+    "COUNTY",
+    "DWM_COARSE_WOODY_DEBRIS",
+    "DWM_DUFF_LITTER_FUEL",
+    "DWM_FINE_WOODY_DEBRIS",
+    "DWM_MICROPLOT_FUEL",
+    "DWM_RESIDUAL_PILE",
+    "DWM_TRANSECT_SEGMENT",
+    "DWM_VISIT",
+    "GRND_CVR",
+    "INVASIVE_SUBPLOT_SPP",
+    "LICHEN_LAB",
+    "LICHEN_PLOT_SUMMARY",
+    "LICHEN_VISIT",
+    "OZONE_BIOSITE_SUMMARY",
+    "OZONE_PLOT_SUMMARY",
+    "OZONE_PLOT",
+    "OZONE_SPECIES_SUMMARY",
+    "OZONE_VALIDATION",
+    "OZONE_VISIT",
+    "P2VEG_SUBP_STRUCTURE",
+    "P2VEG_SUBPLOT_SPP",
+    "PLOT_REGEN",
+    "PLOT",
+    "PLOTGEOM",
+    "PLOTSNAP",
+    "POP_ESTN_UNIT",
+    "POP_EVAL_ATTRIBUTE",
+    "POP_EVAL_GRP",
+    "POP_EVAL_TYP",
+    "POP_EVAL",
+    "POP_PLOT_STRATUM_ASSGN",
+    "POP_STRATUM",
+    "REF_SPECIES",
+    "SEEDLING_REGEN",
+    "SEEDLING",
+    "SITETREE",
+    "SOILS_EROSION",
+    "SOILS_LAB",
+    "SOILS_SAMPLE_LOC",
+    "SOILS_VISIT",
+    "SUBP_COND_CHNG_MTRX",
+    "SUBP_COND",
+    "SUBPLOT_REGEN",
+    "SUBPLOT",
+    "SURVEY",
+    "TREE_GRM_BEGIN",
+    "TREE_GRM_COMPONENT",
+    "TREE_GRM_ESTN",
+    "TREE_GRM_MIDPT",
+    "TREE_REGIONAL_BIOMASS",
+    "TREE_WOODLAND_STEMS",
+    "TREE",
+    "VEG_PLOT_SPECIES",
+    "VEG_QUADRAT",
+    "VEG_SUBPLOT_SPP",
+    "VEG_SUBPLOT",
+    "VEG_VISIT",
+    "CITATION",
+    "DIFFERENCE_TEST_PER_ACRE",
+    "DIFFERENCE_TEST_TOTALS",
+    "FIADB_VERSION",
+    "FOREST_TYPE",
+    "FOREST_TYPE_GROUP",
+    "GRM_TYPE",
+    "HABTYP_DESCRIPTION",
+    "HABTYP_PUBLICATION",
+    "INVASIVE_SPECIES",
+    "LICHEN_SPECIES",
+    "LICHEN_SPP_COMMENTS",
+    "NVCS_HEIRARCHY_STRCT",
+    "NVCS_LEVEL_1_CODES",
+    "NVCS_LEVEL_2_CODES",
+    "NVCS_LEVEL_3_CODES",
+    "NVCS_LEVEL_4_CODES",
+    "NVCS_LEVEL_5_CODES",
+    "NVCS_LEVEL_6_CODES",
+    "NVCS_LEVEL_7_CODES",
+    "NVCS_LEVEL_8_CODES",
+    "OWNGRPCD",
+    "PLANT_DICTIONARY",
+    "POP_ATTRIBUTE",
+    "POP_EVAL_TYP_DESCR",
+    "RESEARCH_STATION",
+    "SPECIES",
+    "SPECIES_GROUP",
+    "STATE_ELEV",
+    "UNIT",
+    "FVS_PLOTINIT_PLOT",
+    "FVS_GROUPADDFILESANDKEYWORDS",
+    "FVS_STANDINIT_COND",
+    "FVS_TREEINIT_PLOT",
+    "FVS_STANDINIT_PLOT",
+    "FVS_TREEINIT_COND",
+]
+
+ALL_STATES: List[str] = [
+    "AL",
+    "AK",
+    "AZ",
+    "AR",
+    "CA",
+    "CO",
+    "CT",
+    "DE",
+    "FL",
+    "GA",
+    "HI",
+    "ID",
+    "IL",
+    "IN",
+    "IA",
+    "KS",
+    "KY",
+    "LA",
+    "ME",
+    "MD",
+    "MA",
+    "MI",
+    "MN",
+    "MS",
+    "MO",
+    "MT",
+    "NE",
+    "NV",
+    "NH",
+    "NJ",
+    "NM",
+    "NY",
+    "NC",
+    "ND",
+    "OH",
+    "OK",
+    "OR",
+    "PA",
+    "RI",
+    "SC",
+    "SD",
+    "TN",
+    "TX",
+    "UT",
+    "VT",
+    "VA",
+    "WA",
+    "WV",
+    "WI",
+    "WY",
+    "AS",
+    "FM",
+    "GU",
+    "MP",
+    "PW",
+    "PR",
+    "VI",
+    "ENTIRE",
+    "REF",
+]
+
+
+@dataclass
+class FiaDatabase(Mapping[str, pd.DataFrame]):
+    """
+    Minimal in-memory representation of an FIA database.
+
+    This mirrors the R `FIA.Database` class conceptually: a mapping
+    from uppercase table names (e.g., 'PLOT', 'TREE') to pandas
+    DataFrames.
+    """
+
+    tables: Dict[str, pd.DataFrame]
+
+    def __getitem__(self, key: str) -> pd.DataFrame:
+        return self.tables[key.upper()]
+
+    def __iter__(self):
+        return iter(self.tables)
+
+    def __len__(self) -> int:
+        return len(self.tables)
+
+    def keys(self) -> Iterable[str]:  # type: ignore[override]
+        return self.tables.keys()
+
+
+def _ensure_dir(path: Path) -> None:
+    if not path.exists():
+        path.mkdir(parents=True, exist_ok=True)
+
+
+def _download_file(url: str, dest: Path, timeout: int = 3600) -> None:
+    with requests.get(url, stream=True, timeout=timeout) as r:
+        r.raise_for_status()
+        total = int(r.headers.get("Content-Length", 0))
+        with open(dest, "wb") as f, tqdm(
+            total=total, unit="B", unit_scale=True, desc=dest.name
+        ) as pbar:
+            for chunk in r.iter_content(chunk_size=8192):
+                if not chunk:
+                    continue
+                f.write(chunk)
+                pbar.update(len(chunk))
+
+
+def get_fia(
+    states: Sequence[str],
+    dir: Optional[str] = None,
+    common: bool = True,
+    tables: Optional[Sequence[str]] = None,
+    load: bool = True,
+) -> Optional[FiaDatabase]:
+    """
+    Download FIA data from the FIA Datamart, loosely mirroring rFIA::getFIA.
+
+    Differences from the R implementation:
+    - Only the "download specific tables" pathway is currently implemented
+      (i.e., `tables` must be provided).
+    - Parallelism / nCores is not yet implemented; downloads are sequential.
+    - Error messages are simplified but follow the same logic.
+    """
+
+    if dir is None and not load:
+        raise ValueError('Must specify `dir` when `load=False`.')
+
+    states = [s.upper() for s in states]
+
+    if "REF" in states and len(set(states)) > 1:
+        raise ValueError('Download reference tables and state subsets separately.')
+
+    if any(s not in ALL_STATES for s in states):
+        missing = [s for s in states if s not in ALL_STATES]
+        raise ValueError(
+            "Data unavailable for: "
+            + ", ".join(missing)
+            + ". Use state/territory abbreviations like 'AL', 'CT', 'PR', etc."
+        )
+
+    if tables is None:
+        raise NotImplementedError(
+            "`get_fia` in Python currently requires `tables` to be specified. "
+            "The full-state ZIP workflow has not been ported yet."
+        )
+
+    tables = [t.upper() for t in tables]
+    if any(t not in KNOWN_TABLES for t in tables):
+        missing = [t for t in tables if t not in KNOWN_TABLES]
+        raise ValueError(
+            "Tables unavailable or unrecognized: "
+            + ", ".join(missing)
+            + ". Check the FIA Datamart for valid table names."
+        )
+
+    if dir is None:
+        dest_dir = Path(tempfile.mkdtemp(prefix="rfia_"))
+    else:
+        dest_dir = Path(dir).expanduser().absolute()
+        _ensure_dir(dest_dir)
+
+    result_tables: Dict[str, pd.DataFrame] = {}
+
+    # ENTIRE naming convention uses just TABLE.zip; otherwise STATE_TABLE.zip.
+    state_prefixes: List[str]
+    if "ENTIRE" in states:
+        state_prefixes = [""]
+    else:
+        state_prefixes = [f"{s}_" for s in states]
+
+    for s_prefix in state_prefixes:
+        for t in tables:
+            zip_name = f"{s_prefix}{t}.zip"
+            url = f"{FIA_BASE_URL}/{zip_name}"
+            zip_path = dest_dir / zip_name
+
+            _download_file(url, zip_path)
+
+            # Extract the CSV inside
+            with tempfile.TemporaryDirectory() as tmpdir:
+                tmpdir_path = Path(tmpdir)
+                shutil.unpack_archive(str(zip_path), str(tmpdir_path))
+                # Assume exactly one CSV inside, matching the rFIA convention
+                csv_files = list(tmpdir_path.glob("*.csv"))
+                if not csv_files:
+                    raise RuntimeError(f"No CSV found in archive {zip_name}")
+                csv_path = csv_files[0]
+
+                # Optionally copy the CSV to dest_dir if user requested dir
+                if dir is not None:
+                    target_path = dest_dir / csv_path.name
+                    shutil.move(str(csv_path), target_path)
+                    csv_path = target_path
+
+                if load:
+                    df = pd.read_csv(csv_path, dtype_backend="pyarrow")
+                    key = csv_path.stem  # e.g. 'AL_PLOT'
+                    result_tables[key] = df
+
+            # When load=False, we do not need to retain the ZIP archives on disk;
+            # remove them so get_fia leaves only the extracted CSVs in `dir`.
+            if not load and zip_path.exists():
+                zip_path.unlink()
+
+    if not load:
+        return None
+
+    # Merge across states into a single table per logical name, similar to rFIA
+    merged: Dict[str, pd.DataFrame] = {}
+    for key, df in result_tables.items():
+        # Drop state prefix if present: 'AL_PLOT' -> 'PLOT'
+        name_parts = key.split("_", 1)
+        logical_name = name_parts[1] if len(name_parts) == 2 else name_parts[0]
+        logical_name = logical_name.upper()
+        if logical_name in merged:
+            merged[logical_name] = pd.concat([merged[logical_name], df], ignore_index=True)
+        else:
+            merged[logical_name] = df
+
+    return FiaDatabase(merged)
+
+
+def read_fia(
+    dir: str,
+    tables: Optional[Sequence[str]] = None,
+    common: bool = True,
+) -> FiaDatabase:
+    """
+    Read FIA CSV files from a local directory into a `FiaDatabase`.
+
+    This is a partial port of `rFIA::readFIA` for the in-memory CSV case.
+
+    Parameters
+    ----------
+    dir:
+        Directory containing FIA CSV files, typically downloaded via `get_fia`
+        or manually from the FIA Datamart.
+    tables:
+        Optional sequence of table base names (e.g. ['PLOT', 'TREE']). If
+        omitted and `common=True`, a default "common" subset will be loaded.
+    common:
+        If True and `tables` is None, load a common subset of frequently used
+        tables (PLOT, TREE, COND, etc.), mirroring the R package behavior.
+    """
+
+    path = Path(dir).expanduser().absolute()
+    if not path.exists():
+        raise FileNotFoundError(f"Directory {path} does not exist.")
+
+    csv_files = sorted(p for p in path.iterdir() if p.suffix.lower() == ".csv")
+    if not csv_files:
+        raise FileNotFoundError(f"Directory {path} contains no .csv files.")
+
+    all_tables = {p.stem for p in csv_files}
+
+    # Derive base names (drop state prefixes like 'AL_', 'REF_')
+    base_names: List[str] = []
+    for name in all_tables:
+        parts = name.split("_", 1)
+        if len(parts) == 2 and len(parts[0]) in (2, 3):
+            base_names.append(parts[1])
+        else:
+            base_names.append(name)
+
+    base_names_set = {b.upper() for b in base_names}
+
+    # Common tables, ported from rFIA::readFIA
+    common_tables = {
+        "COND",
+        "COND_DWM_CALC",
+        "INVASIVE_SUBPLOT_SPP",
+        "PLOT",
+        "POP_ESTN_UNIT",
+        "POP_EVAL",
+        "POP_EVAL_GRP",
+        "POP_EVAL_TYP",
+        "POP_PLOT_STRATUM_ASSGN",
+        "POP_STRATUM",
+        "SUBPLOT",
+        "TREE",
+        "TREE_GRM_COMPONENT",
+        "TREE_GRM_MIDPT",
+        "TREE_GRM_BEGIN",
+        "SUBP_COND_CHNG_MTRX",
+        "SEEDLING",
+        "SURVEY",
+        "SUBP_COND",
+        "P2VEG_SUBP_STRUCTURE",
+        "PLOTGEOM",
+    }
+
+    if tables is not None:
+        wanted = {t.upper() for t in tables}
+    elif common:
+        wanted = common_tables
+    else:
+        wanted = base_names_set.intersection({t.upper() for t in KNOWN_TABLES})
+
+    selected_files: List[Path] = []
+    for p in csv_files:
+        stem = p.stem
+        parts = stem.split("_", 1)
+        if len(parts) == 2 and len(parts[0]) in (2, 3):
+            logical = parts[1].upper()
+        else:
+            logical = stem.upper()
+        if logical in wanted:
+            selected_files.append(p)
+
+    tables_dict: Dict[str, pd.DataFrame] = {}
+    for p in selected_files:
+        df = pd.read_csv(p, dtype_backend="pyarrow")
+        stem = p.stem
+        parts = stem.split("_", 1)
+        if len(parts) == 2 and len(parts[0]) in (2, 3):
+            logical = parts[1].upper()
+        else:
+            logical = stem.upper()
+
+        if logical in tables_dict:
+            tables_dict[logical] = pd.concat([tables_dict[logical], df], ignore_index=True)
+        else:
+            tables_dict[logical] = df
+
+    return FiaDatabase(tables_dict)
+
