@@ -46,10 +46,13 @@ from fia import (
 
 - **`get_fia(states, dir=None, common=True, tables=None, load=True)`**
   - Downloads FIA CSVs from the FIA Datamart and optionally loads them into memory.
-  - **`tables` is required** in the Python port (full-state ZIP-only workflow is not implemented yet).
+  - **`states`** may be a single string (e.g. **`"AZ"`**) or a sequence — a string is treated as one state, not as individual characters.
+  - When **`dir`** is set, the folder is **created if it does not exist** (including parents).
+  - **`tables` is required** in the Python port (full-state ZIP-only workflow is not implemented yet). **`tables`** may be one table name as a string or a list of names.
   - Merges per-state tables into a single logical table per name (e.g. `PLOT`, `TREE`).
   - Returns a **`FiaDatabase`** (a mapping from table name → `pandas.DataFrame`) when **`load=True`**; returns **`None`** when **`load=False`** after writing CSVs to **`dir`**.
   - When **`load=False`**, **`.zip`** files are deleted after extraction so **`dir`** contains only CSVs.
+  - If the expected CSV for a requested state/table (e.g. **`AZ_PLOT.csv`**) already exists in **`dir`**, that table is **not** re-downloaded; **`get_fia`** prints a skip message. With **`load=True`**, it still loads from the existing file.
 
 - **`read_fia(dir, tables=None, common=True)`**
   - Reads FIA CSVs from a local directory into a **`FiaDatabase`**.
@@ -147,6 +150,14 @@ Implementation package: **`fia_mog`** (sibling of **`fia`**). Auxiliary tables a
 - **`mog_condition_scores(db, ..., mog_auxiliary_dir=None, use_montana_divide_shapefile=True)`** — condition-level MOG scores; defaults to **`fia_py/mog_auxillary`** for species CSV and MT divide when present.
 - **`old_growth_area(...)`** — same kwargs; returns **`MOGAreaResult`** with **`df`** (**`OG_PROP`**), **`forest_area_df`** (**`FOREST_PROP`**), **`cond_mog`**.
 - **`fia.mog`** re-exports **`fia_mog.engine`** (**`ConditionContext`**, **`MOGEngine`**, …). MOG scoring and area helpers are on the top-level **`fia`** import (**`mog_condition_scores`**, **`old_growth_area`**, **`MOGAreaResult`**) from **`fia_mog.estimators`**.
+
+**Note (Southwest Region 3, Table 9 SDI%):** Table 9 SDI thresholds are interpreted as **percent of COND.SDI_RMRS** using the same numerator as OFE / ``rFIA-ofe-region3.R``: **SDI_OFE** = Σ``TPA_UNADJ × (DIA/10)^1.6`` on **live** trees with **DIA ≥ 18** in, then **SW_REL_SDI** = ``100 × SDI_OFE / SDI_RMRS``. **`mog_condition_scores`** merges **``SDI_RMRS``** from **COND** (when present). If **``SDI_RMRS``** is missing or not positive, **SW_REL_SDI** is undefined (**NaN**) and SDI-based Table 9 rules do not pass. Diagnostics also emit **``SW_SDI_OFE``** and **``SW_SDI_RMRS``**. Example thresholds: **Ponderosa Pine -- Evergreen Oak** **≥ 26%**; *Ponderosa Pine Forest* and *Ponderosa Pine/Willow* **≥ 57%**; *Mixed Conifer -- Frequent Fire* **≥ 56%**. **`SW_PASS_SDI_GE_26`** (and similar) flag ``SW_REL_SDI`` against fixed cutoffs for summaries.
+
+**Note (Southwest Table 9 QMD, live trees ≥ 10 in):** **`FUNCTION_mapMOG.R`** uses a **non-standard** basal term ``π × (DIA/24) × 2`` (linear in DBH) and, in the QMD ratio, **sample stem density** ``nrow / condition.area`` while the numerator uses **expanded** ``TPA_UNADJ``. **`fia_mog.southwest`** follows **conventional** FIA-style QMD: basal area per tree ``π × (DIA/24)²`` ft² (DBH in inches), basal area per acre ``Σ(TPA_UNADJ × BA_tree)``, then ``QMD = sqrt((BA_ac / ΣTPA_UNADJ) / 0.005454)``—the same structure as typical OFE/MOG R helpers that use ``sum(TPA_UNADJ)`` in the denominator. This **differs from bundled mapMOG** but matches standard BA–TPA–QMD algebra; OG flags use **full precision** (no ``round(..., 1)``).
+
+**Note (Southwest `OG_PROP` / `OG_FLAG`):** The MOG vector is **old-growth first, then Table 19 maturity** (same pattern as R). Maturity components are weighted scores that can reach **1.0** when every criterion is met. Using `max(MOG.vector) == 1` for old-growth **area** therefore counts **mature** forest as old growth. For **Region 3 (southwest)** only, **`mog_condition_scores`** sets **`OG_FLAG`** from the **first** vector element (Table 9 binary OG). **`MOG_SCORE`** remains the max of the full vector for diagnostics. Other regions still use the legacy `max == 1` rule and may need the same split if you rely on their **`OG_PROP`** totals.
+
+**If `OG_PROP` totals do not change after updating this logic:** Python may be using a **cached** `fia_mog.estimators` (e.g. Jupyter imported `fia` before editing the repo, or `import fia` bound `old_growth_area` from an older install). **Restart the kernel** or run `import importlib, fia_mog.estimators as e; importlib.reload(e)` (and reload `fia` if you use `from fia import old_growth_area`). Prefer **`from fia_mog.estimators import old_growth_area`** or **`from fia.data_io import …`** / **`from fia.clip import clip_fia`** so **`fia.__init__`** does not pin an old MOG binding; **`scripts/test_mog_area.py`** follows that pattern.
 
 **Note (removed compatibility modules, March 2026):** The stub modules **`fia.mog_crosswalk`** and **`fia.mog_estimators`** were deleted as redundant with **`fia_mog.crosswalk`** and **`fia_mog.estimators`**. **`MOGAreaResult`**, **`mog_condition_scores`**, and **`old_growth_area`** remain on the top-level **`fia`** import; crosswalk helpers (**`classify_region`**, …) live only under **`fia_mog.crosswalk`**. If old code used **`from fia.mog_crosswalk import …`** or **`from fia.mog_estimators import …`**, use those **`fia_mog`** modules (or **`from fia import …`** for the three estimators above). To revisit: restore two small files that **`from fia_mog.crosswalk import *`** and **`from fia_mog.estimators import MOGAreaResult, mog_condition_scores, old_growth_area`** respectively, matching the previous layout.
 

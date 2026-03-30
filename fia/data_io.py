@@ -202,8 +202,19 @@ class FiaDatabase(Mapping[str, pd.DataFrame]):
 
 
 def _ensure_dir(path: Path) -> None:
-    if not path.exists():
-        path.mkdir(parents=True, exist_ok=True)
+    """
+    Ensure ``path`` exists as a directory, creating it (and parents) if needed.
+
+    Raises
+    ------
+    NotADirectoryError
+        If ``path`` exists but is not a directory.
+    """
+    if path.exists():
+        if not path.is_dir():
+            raise NotADirectoryError(f"Path exists but is not a directory: {path}")
+        return
+    path.mkdir(parents=True, exist_ok=True)
 
 
 def _download_file(url: str, dest: Path, timeout: int = 3600) -> None:
@@ -221,25 +232,45 @@ def _download_file(url: str, dest: Path, timeout: int = 3600) -> None:
 
 
 def get_fia(
-    states: Sequence[str],
+    states: str | Sequence[str],
     dir: Optional[str] = None,
     common: bool = True,
-    tables: Optional[Sequence[str]] = None,
+    tables: Optional[str | Sequence[str]] = None,
     load: bool = True,
 ) -> Optional[FiaDatabase]:
     """
     Download FIA data from the FIA Datamart, loosely mirroring rFIA::getFIA.
+
+    Parameters
+    ----------
+    states:
+        State / territory codes. Pass a single string (e.g. ``"AZ"``) or a
+        sequence (e.g. ``["AZ", "NM"]``). A bare string is **not** split into
+        characters — this matches ``rFIA::getFIA(states = "AZ")``.
+    dir:
+        Destination folder for downloaded archives and extracted CSVs. If this
+        path does not exist, it is created (including parent directories). If
+        ``dir`` is omitted and ``load=True``, a temporary directory is used.
+    tables:
+        Table names to download. Pass one name as a string or several as a
+        sequence (e.g. ``\"PLOT\"`` or ``[\"PLOT\", \"TREE\"]``).
 
     Differences from the R implementation:
     - Only the "download specific tables" pathway is currently implemented
       (i.e., `tables` must be provided).
     - Parallelism / nCores is not yet implemented; downloads are sequential.
     - Error messages are simplified but follow the same logic.
+    - If the expected extracted CSV for a state/table pair already exists in
+      ``dir``, that download is skipped and a short message is printed.
     """
 
     if dir is None and not load:
         raise ValueError('Must specify `dir` when `load=False`.')
 
+    if isinstance(states, str):
+        states = [states]
+    else:
+        states = list(states)
     states = [s.upper() for s in states]
 
     if "REF" in states and len(set(states)) > 1:
@@ -259,6 +290,10 @@ def get_fia(
             "The full-state ZIP workflow has not been ported yet."
         )
 
+    if isinstance(tables, str):
+        tables = [tables]
+    else:
+        tables = list(tables)
     tables = [t.upper() for t in tables]
     if any(t not in KNOWN_TABLES for t in tables):
         missing = [t for t in tables if t not in KNOWN_TABLES]
@@ -288,6 +323,18 @@ def get_fia(
             zip_name = f"{s_prefix}{t}.zip"
             url = f"{FIA_BASE_URL}/{zip_name}"
             zip_path = dest_dir / zip_name
+            # Datamart CSV basename matches the zip stem (e.g. AZ_PLOT.zip → AZ_PLOT.csv).
+            expected_csv = dest_dir / f"{s_prefix}{t}.csv"
+
+            if expected_csv.is_file():
+                print(
+                    f"get_fia: skip download (already present): {expected_csv}",
+                    flush=True,
+                )
+                if load:
+                    df = pd.read_csv(expected_csv, dtype_backend="pyarrow")
+                    result_tables[expected_csv.stem] = df
+                continue
 
             _download_file(url, zip_path)
 

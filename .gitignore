@@ -38,6 +38,7 @@ htmlcov/
 
 # Local / scratch
 *.log
+diagnostics_export/
 
 # Local MOG CSV outputs
 mt_mog_v2.csv

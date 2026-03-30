@@ -5,6 +5,7 @@ or install the project in editable mode (``pip install -e .``).
 
 from __future__ import annotations
 
+import math
 import sys
 from pathlib import Path
 
@@ -53,7 +54,9 @@ def compute_mog_for_arizona(db: FiaDatabase) -> pd.DataFrame:
         "SITECLCD",
         "ADFORCD",
         "STATECD",
+        "SDI_RMRS",
     ]
+    cond_cols_for_trees = [c for c in cond_cols_for_trees if c in conds_az.columns]
     trees_az = trees.merge(
         conds_az[cond_cols_for_trees],
         on=["PLT_CN", "CONDID"],
@@ -94,6 +97,17 @@ def compute_mog_for_arizona(db: FiaDatabase) -> pd.DataFrame:
         sitecl_val = c["SITECLCD"]
         sitecl_float = None if pd.isna(sitecl_val) else float(sitecl_val)
 
+        sdi_rmrs_ctx = None
+        if "SDI_RMRS" in c.index:
+            rmrs = c.get("SDI_RMRS")
+            if rmrs is not None and not pd.isna(rmrs):
+                try:
+                    rmrs_f = float(rmrs)
+                    if math.isfinite(rmrs_f) and rmrs_f > 0:
+                        sdi_rmrs_ctx = rmrs_f
+                except (TypeError, ValueError):
+                    pass
+
         ctx = ConditionContext(
             region=region,
             forest_type=forest_type,
@@ -106,6 +120,7 @@ def compute_mog_for_arizona(db: FiaDatabase) -> pd.DataFrame:
             condition_siteclcd=sitecl_float,
             condition_adforcd=adforcd_int,
             condition_habtypcd1=c["HABTYPCD1"],  # <-- single value from COND
+            condition_sdi_rmrs=sdi_rmrs_ctx,
             ecosubcd=None,
         )
 

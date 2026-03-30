@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Iterable, Optional, Sequence
@@ -17,6 +18,8 @@ from .auxiliary import (
 )
 from .crosswalk import classify_region, statecd_to_abbrev
 from .engine import ConditionContext, MOGEngine
+from .southwest.diagnostics import MOG_CONDITION_SW_COLUMNS
+from .southwest.evaluate import southwest_og_diagnostic_row
 from .paths import (
     master_tree_species_csv,
     oregon_counties_shp,
@@ -55,6 +58,38 @@ class MOGAreaResult:
     df: pd.DataFrame
     cond_mog: pd.DataFrame
     forest_area_df: pd.DataFrame = field(default_factory=pd.DataFrame)
+
+
+def _region_is_southwest(region: object) -> bool:
+    """True for Region 3 MOG (``classify_region`` → ``southwest``), robust to NA-like values."""
+
+    if region is None:
+        return False
+    try:
+        if pd.isna(region):
+            return False
+    except (TypeError, ValueError):
+        pass
+    return str(region).strip().lower() == "southwest"
+
+
+def _og_flag_for_condition(region: object, mog_vec: list[float]) -> float:
+    """
+    Old-growth (0/1) for ``OG_PROP`` / ``old_growth_area``, distinct from **mature**
+    structure scores.
+
+    The MOG vector is ``c(OG, mature…)`` in R: the first component is Table 9
+    (Southwest) or equivalent **binary** OG; later components are Table 19-style
+    weighted indices whose weights often sum to **1.0**, so ``max(mog_vec) == 1``
+    would label **mature** stands as old growth. Region 3 therefore uses
+    ``mog_vec[0]`` only for ``OG_FLAG``.
+    """
+
+    if not mog_vec:
+        return 0.0
+    if _region_is_southwest(region):
+        return 1.0 if float(mog_vec[0]) >= 1.0 else 0.0
+    return 1.0 if max(mog_vec) == 1.0 else 0.0
 
 
 def _safe_max_age(stdage: object, fldage: object) -> float:
@@ -114,10 +149,18 @@ def mog_condition_scores(
     test plot overlap for **white fir** Table 12 logic (R loads PAZ+NWFP for CA/NV; MOG uses
     NWFP for PSW white fir only, not the PAZ raster).
 
+    For **southwest** Table 9 SDI rules, **COND** should include **``SDI_RMRS``** (FIADB field)
+    so **SW_REL_SDI** can be computed as ``100 × SDI_OFE / SDI_RMRS``; it is merged from
+    **COND** when that column exists.
+
     Output columns:
     - PLT_CN, CONDID
-    - MOG_SCORE (max of mog vector)
-    - OG_FLAG (1 if MOG_SCORE == 1 else 0)
+    - MOG_SCORE (max of mog vector; can be 1 from Table 19 maturity weights alone)
+    - OG_FLAG (binary **old growth** for area expansion: Southwest uses
+      ``mog_vec[0]`` (Table 9 only); other regions still use ``max(mog_vec) == 1``)
+    - For **southwest** rows only, Table 9 / Table 19 diagnostics (``SW_*`` columns;
+      see :func:`fia_mog.southwest.diagnostics.summarize_southwest_og_by_eru`); ``pd.NA``
+      elsewhere
     - AREA_BASIS (from COND.PROP_BASIS)
     - CONDPROP_UNADJ
     - PROP_FOREST (CONDPROP_UNADJ × land domain; same definition as ``area`` / ``tpa``)
@@ -179,6 +222,7 @@ def mog_condition_scores(
         "FLDAGE",
         "HABTYPCD1",
         "SITECLCDEST",
+        "SDI_RMRS",
         "landD",
         "PROP_FOREST",
     ]
@@ -188,6 +232,7 @@ def mog_condition_scores(
 
     engine = MOGEngine()
     out = []
+    sw_diag_na = {k: pd.NA for k in MOG_CONDITION_SW_COLUMNS}
     aux_dir = resolve_mog_auxiliary_dir(mog_auxiliary_dir)
     master_csv = master_tree_species_csv(aux_dir)
     if master_csv.is_file():
@@ -273,6 +318,16 @@ def mog_condition_scores(
             except (KeyError, TypeError, ValueError):
                 pass
 
+        sdi_rmrs: float | None = None
+        if "SDI_RMRS" in g.columns:
+            raw_rmrs = c.get("SDI_RMRS")
+            if raw_rmrs is not None and not pd.isna(raw_rmrs):
+                try:
+                    sdi_rmrs_f = float(raw_rmrs)
+                    sdi_rmrs = sdi_rmrs_f if math.isfinite(sdi_rmrs_f) and sdi_rmrs_f > 0 else None
+                except (TypeError, ValueError):
+                    sdi_rmrs = None
+
         ctx = ConditionContext(
             region=region or "",
             forest_type=int(c["FLDTYPCD"]),
@@ -286,6 +341,7 @@ def mog_condition_scores(
             condition_siteclcdest=None if pd.isna(c.get("SITECLCDEST")) else float(c.get("SITECLCDEST")),
             condition_adforcd=None if pd.isna(c.get("ADFORCD")) else int(c.get("ADFORCD")),
             condition_habtypcd1=None if pd.isna(c.get("HABTYPCD1")) else float(c.get("HABTYPCD1")),
+            condition_sdi_rmrs=sdi_rmrs,
             ecosubcd=eco_str,
             northern_species_lookup=ref_lookup,
             northern_veg_subplot=p2veg,
@@ -300,18 +356,27 @@ def mog_condition_scores(
         mog_vec = engine.mog_vector(ctx)
         mog_score = max(mog_vec, default=0.0)
 
+        if _region_is_southwest(region):
+            diag = southwest_og_diagnostic_row(ctx)
+            if len(mog_vec) > 1:
+                diag = {**diag, "SW_MATURITY_SCORE": float(max(mog_vec[1:]))}
+            else:
+                diag = {**diag, "SW_MATURITY_SCORE": pd.NA}
+        else:
+            diag = dict(sw_diag_na)
+
         out.append(
             {
                 "PLT_CN": plt_cn,
                 "CONDID": condid,
                 "MOG_SCORE": float(mog_score),
-                # Old growth (1) only when MOG_SCORE is exactly 1.0
-                "OG_FLAG": float(1.0 if float(mog_score) == 1.0 else 0.0),
+                "OG_FLAG": _og_flag_for_condition(region, mog_vec),
                 "AREA_BASIS": c.get("PROP_BASIS"),
                 "CONDPROP_UNADJ": float(c.get("CONDPROP_UNADJ", 0.0) or 0.0),
                 "PROP_FOREST": float(c.get("PROP_FOREST", 0.0) or 0.0),
                 "ADFORCD": c.get("ADFORCD"),
                 "EVAL_TYP": eval_typ,
+                **diag,
             }
         )
 
@@ -339,7 +404,9 @@ def old_growth_area(
 
         OG_PROP = PROP_FOREST * OG_FLAG
 
-    where ``PROP_FOREST`` is ``CONDPROP_UNADJ × landD`` (same as ``area`` / ``tpa``).
+    where ``PROP_FOREST`` is ``CONDPROP_UNADJ × landD`` (same as ``area`` / ``tpa``),
+    and ``OG_FLAG`` is **old-growth only** (see :func:`mog_condition_scores`: for
+    **southwest**, the first MOG vector element—Table 9—not ``max(vector)==1``).
 
     This sums to plot level (with non-response adjustment by AREA_BASIS),
     then is expanded to area totals by the design frame inside `custom_pse`.

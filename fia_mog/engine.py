@@ -45,6 +45,8 @@ class ConditionContext:
     condition_siteclcdest: float | None = None
     condition_adforcd: int | None = None
     condition_habtypcd1: float | int | None = None
+    # Region 3 Table 9 SDI% denominator: COND.SDI_RMRS (Reinecke-style max SDI).
+    condition_sdi_rmrs: float | None = None
     ecosubcd: str | None = None
     # Northern Region: optional FIA REF_SPECIES-style lookup (SPCD → PLANTS symbol)
     northern_species_lookup: pd.DataFrame | None = None
