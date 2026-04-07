@@ -47,5 +47,6 @@ mt_mog.csv
 # GitHub blocks files >100MB; >50MB triggers a warning. Keep these local or ship via
 # release assets / download instructions (see README tests section).
 mog_auxillary/utility_R5_PAZ.tif
-tests/fiadb/AZ/
-tests/fiadb/MT/
+#tests/fiadb/AZ/
+#tests/fiadb/MT/
+tests/fiadb

@@ -15,14 +15,9 @@ if TYPE_CHECKING:
     from ..engine import ConditionContext, TreeMetrics
 
 
-def pacific_northwest_mog_vector(ctx: "ConditionContext", metrics: "TreeMetrics") -> List[float]:
+def pacific_northwest_og_vector(ctx: "ConditionContext") -> List[float]:
     """
-    Full ``region %in% "pacific northwest"`` branch.
-
-    Requires :class:`~fia_mog.engine.ConditionContext` fields populated for PNW
-    (PAZ value, inside-NWFP flag, woody debris, site class, optional ECOSUBCD /
-    OR-county overlay). See ``mog_condition_scores`` for automatic filling when
-    auxiliary rasters/shapefiles and tables are available.
+    Table 13 / 14 binary OG components only (no Table 19 maturity).
     """
 
     paz_raw = ctx.pnw_paz_raster_value
@@ -57,6 +52,25 @@ def pacific_northwest_mog_vector(ctx: "ConditionContext", metrics: "TreeMetrics"
                 ctx.pnw_plot_in_or_counties_layer,
             )
         )
+
+    return og
+
+
+def pacific_northwest_mog_vector(ctx: "ConditionContext", metrics: "TreeMetrics") -> List[float]:
+    """
+    Full ``region %in% "pacific northwest"`` branch.
+
+    Requires :class:`~fia_mog.engine.ConditionContext` fields populated for PNW
+    (PAZ value, inside-NWFP flag, woody debris, site class, optional ECOSUBCD /
+    OR-county overlay). See ``mog_condition_scores`` for automatic filling when
+    auxiliary rasters/shapefiles and tables are available.
+    """
+
+    paz_raw = ctx.pnw_paz_raster_value
+    paz_group = paz_value_to_group(paz_raw) if paz_raw is not None else None
+
+    og = pacific_northwest_og_vector(ctx)
+    inside = ctx.pnw_inside_nwfp
 
     last_og = og[-1] if og else 0.0
     out = list(og)

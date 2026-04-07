@@ -7,6 +7,10 @@ from typing import Iterable, Optional, Sequence
 
 import pandas as pd
 
+# Bump together with ``scripts/test_mog_area_mt.py`` ``MOG_MT_SCRIPT_BUILD_STAMP`` when
+# changing condition filters or forest-type logic; ``--verify-mog-code`` asserts they match.
+MOG_ESTIMATORS_REVISION = "radical-verify-2026-03-29-t5"
+
 from fia.data_io import FiaDatabase
 from fia.estimators import _land_type_domain, custom_pse
 
@@ -18,6 +22,7 @@ from .auxiliary import (
 )
 from .crosswalk import classify_region, statecd_to_abbrev
 from .engine import ConditionContext, MOGEngine
+from .northern.diagnostics import MOG_CONDITION_NR_COLUMNS, northern_veg_diagnostic_row
 from .southwest.diagnostics import MOG_CONDITION_SW_COLUMNS
 from .southwest.evaluate import southwest_og_diagnostic_row
 from .paths import (
@@ -41,6 +46,49 @@ def _ref_species_lookup(ref: pd.DataFrame | None) -> pd.DataFrame | None:
             out = ref[["SPCD", col]].drop_duplicates(subset=["SPCD"])
             return out.rename(columns={col: "PLANTS_Code"})
     return None
+
+
+def _to_int_or_na(val: object) -> object:
+    """Coerce FIADB codes to int for CSV output; missing/invalid → pandas NA."""
+    if val is None:
+        return pd.NA
+    num = pd.to_numeric(val, errors="coerce")
+    if pd.isna(num):
+        return pd.NA
+    try:
+        return int(num)
+    except (TypeError, ValueError, OverflowError):
+        return pd.NA
+
+
+def _mog_forest_type_from_cond_row(c: pd.Series, *, region: str | None = None) -> int:
+    """
+    Forest-type integer for ``ConditionContext.forest_type`` (R uses ``FLDTYPCD``).
+
+    **Northern Region:** If ``FLDTYPCD`` does not map to a Green et al. OG label but
+    ``FORTYPCD`` does (e.g. coarse group vs 221 ponderosa), use the code that maps so
+    habitat OG vectors are not empty while letters still crosswalk from composition.
+
+    Elsewhere, keep mapMOG order: ``FLDTYPCD`` if present, else ``FORTYPCD``.
+    """
+
+    from .northern.core import northern_og_forest_type
+
+    fld = pd.to_numeric(c.get("FLDTYPCD"), errors="coerce")
+    fort = pd.to_numeric(c.get("FORTYPCD"), errors="coerce")
+
+    if _region_is_northern(region):
+        for cand in (fld, fort):
+            if pd.notna(cand):
+                v = int(cand)
+                if northern_og_forest_type(v) is not None:
+                    return v
+
+    if pd.notna(fld):
+        return int(fld)
+    if pd.notna(fort):
+        return int(fort)
+    raise RuntimeError("MOG forest type: FLDTYPCD and FORTYPCD are both missing")
 
 
 @dataclass(frozen=True)
@@ -73,23 +121,17 @@ def _region_is_southwest(region: object) -> bool:
     return str(region).strip().lower() == "southwest"
 
 
-def _og_flag_for_condition(region: object, mog_vec: list[float]) -> float:
-    """
-    Old-growth (0/1) for ``OG_PROP`` / ``old_growth_area``, distinct from **mature**
-    structure scores.
+def _region_is_northern(region: object) -> bool:
+    """True for Region 1 MOG (``classify_region`` → ``northern``)."""
 
-    The MOG vector is ``c(OG, mature…)`` in R: the first component is Table 9
-    (Southwest) or equivalent **binary** OG; later components are Table 19-style
-    weighted indices whose weights often sum to **1.0**, so ``max(mog_vec) == 1``
-    would label **mature** stands as old growth. Region 3 therefore uses
-    ``mog_vec[0]`` only for ``OG_FLAG``.
-    """
-
-    if not mog_vec:
-        return 0.0
-    if _region_is_southwest(region):
-        return 1.0 if float(mog_vec[0]) >= 1.0 else 0.0
-    return 1.0 if max(mog_vec) == 1.0 else 0.0
+    if region is None:
+        return False
+    try:
+        if pd.isna(region):
+            return False
+    except (TypeError, ValueError):
+        pass
+    return str(region).strip().lower() == "northern"
 
 
 def _safe_max_age(stdage: object, fldage: object) -> float:
@@ -156,11 +198,16 @@ def mog_condition_scores(
     Output columns:
     - PLT_CN, CONDID
     - MOG_SCORE (max of mog vector; can be 1 from Table 19 maturity weights alone)
-    - OG_FLAG (binary **old growth** for area expansion: Southwest uses
-      ``mog_vec[0]`` (Table 9 only); other regions still use ``max(mog_vec) == 1``)
+    - OG_FLAG (binary **old growth** for area expansion: regional OG tables only—
+      Table 9 / 11 / 12 / 13–14 style rules—not Table 19 maturity, even if
+      ``MOG_SCORE`` is 1 from maturity weights)
     - For **southwest** rows only, Table 9 / Table 19 diagnostics (``SW_*`` columns;
       see :func:`fia_mog.southwest.diagnostics.summarize_southwest_og_by_eru`); ``pd.NA``
       elsewhere
+    - For **northern** rows only, vegetation / habitat crosswalk diagnostics (``NR_*``;
+      see :func:`fia_mog.northern.diagnostics.summarize_mt_northern_veg_gaps` for Montana
+      summaries); ``pd.NA`` elsewhere
+    - **STATECD** on each row (for filtering to a single state in post-processing)
     - AREA_BASIS (from COND.PROP_BASIS)
     - CONDPROP_UNADJ
     - PROP_FOREST (CONDPROP_UNADJ × land domain; same definition as ``area`` / ``tpa``)
@@ -189,8 +236,18 @@ def mog_condition_scores(
         if "STATECD" in cond.columns and wanted:
             cond = cond[cond["STATECD"].isin(wanted)].copy()
 
-    # Match the core mapMOG condition filter: accessible forest conditions with a forest type.
-    cond = cond[(cond["COND_STATUS_CD"] == 1) & (~cond["FLDTYPCD"].isna())].copy()
+    # Match mapMOG intent: accessible forest conditions with a type code (FLDTYPCD and/or FORTYPCD).
+    fld = pd.to_numeric(cond["FLDTYPCD"], errors="coerce") if "FLDTYPCD" in cond.columns else None
+    fort = (
+        pd.to_numeric(cond["FORTYPCD"], errors="coerce") if "FORTYPCD" in cond.columns else None
+    )
+    if fld is None:
+        has_ft = fort.notna() if fort is not None else pd.Series(False, index=cond.index)
+    elif fort is None:
+        has_ft = fld.notna()
+    else:
+        has_ft = fld.notna() | fort.notna()
+    cond = cond[(cond["COND_STATUS_CD"] == 1) & has_ft].copy()
 
     # Forest / timber land domain (matches fia.estimators.area and tpa).
     for col in ("SITECLCD", "RESERVCD"):
@@ -210,6 +267,7 @@ def mog_condition_scores(
     join_cols = [
         "PLT_CN",
         "CONDID",
+        "COND_STATUS_CD",
         "STATECD",
         "ADFORCD",
         "FLDTYPCD",
@@ -232,7 +290,10 @@ def mog_condition_scores(
 
     engine = MOGEngine()
     out = []
-    sw_diag_na = {k: pd.NA for k in MOG_CONDITION_SW_COLUMNS}
+    _mog_diag_na = {
+        **{k: pd.NA for k in MOG_CONDITION_SW_COLUMNS},
+        **{k: pd.NA for k in MOG_CONDITION_NR_COLUMNS},
+    }
     aux_dir = resolve_mog_auxiliary_dir(mog_auxiliary_dir)
     master_csv = master_tree_species_csv(aux_dir)
     if master_csv.is_file():
@@ -252,6 +313,22 @@ def mog_condition_scores(
         and {"CN", "LON", "LAT"}.issubset(plo.columns)
     ):
         plot_ll_by_cn = plo[["CN", "LON", "LAT"]].drop_duplicates(subset=["CN"]).set_index("CN")
+
+    plot_elev_by_cn: dict[object, float] = {}
+    if (
+        plo is not None
+        and not plo.empty
+        and {"CN", "ELEV"}.issubset(plo.columns)
+    ):
+        pe = plo[["CN", "ELEV"]].drop_duplicates(subset=["CN"])
+        for _, r in pe.iterrows():
+            try:
+                if pd.notna(r["ELEV"]):
+                    ev = float(r["ELEV"])
+                    if math.isfinite(ev):
+                        plot_elev_by_cn[r["CN"]] = ev
+            except (TypeError, ValueError):
+                pass
 
     dwm_by_pc: dict[tuple[object, object], pd.DataFrame] = {}
     dwm_tbl = db.tables.get("DWM_COARSE_WOODY_DEBRIS")
@@ -282,15 +359,20 @@ def mog_condition_scores(
         stand_age = _safe_max_age(c.get("STDAGE"), c.get("FLDAGE"))
         condition_area = _condition_area_acres(c.get("PROP_BASIS"), c.get("CONDPROP_UNADJ"))
 
-        mt_div: bool | None = None
-        if st_abbrev == "MT" and use_montana_divide_shapefile and plot_ll_by_cn is not None:
+        plot_lon_f: float | None = None
+        plot_lat_f: float | None = None
+        if plot_ll_by_cn is not None:
             try:
-                row_ll = plot_ll_by_cn.loc[plt_cn]
-                mt_div = montana_plot_in_cont_divide_east(
-                    float(row_ll["LON"]),
-                    float(row_ll["LAT"]),
-                    aux_dir,
-                )
+                _row_ll = plot_ll_by_cn.loc[plt_cn]
+                plot_lon_f = float(_row_ll["LON"])
+                plot_lat_f = float(_row_ll["LAT"])
+            except (KeyError, TypeError, ValueError):
+                pass
+
+        mt_div: bool | None = None
+        if st_abbrev == "MT" and use_montana_divide_shapefile and plot_lon_f is not None and plot_lat_f is not None:
+            try:
+                mt_div = montana_plot_in_cont_divide_east(plot_lon_f, plot_lat_f, aux_dir)
             except (KeyError, TypeError, ValueError):
                 mt_div = None
 
@@ -302,21 +384,15 @@ def mog_condition_scores(
         eco_str = None if raw_eco is None or pd.isna(raw_eco) else str(raw_eco).strip()
         pnw_site_max = _pnw_site_class_max(c.get("SITECLCD"), c.get("SITECLCDEST"))
 
-        if plot_ll_by_cn is not None:
-            try:
-                row_ll = plot_ll_by_cn.loc[plt_cn]
-                lon_f = float(row_ll["LON"])
-                lat_f = float(row_ll["LAT"])
-                reg = region or ""
-                if reg == "pacific northwest":
-                    pv = sample_r5_paz_value(lon_f, lat_f, paz_tif)
-                    if pv is not None:
-                        pnw_paz = int(round(float(pv)))
-                    pnw_or_counties = oregon_plot_in_counties_layer(lon_f, lat_f, or_shp)
-                if reg in ("pacific northwest", "pacific southwest"):
-                    pnw_inside = plot_inside_nwfp(lon_f, lat_f, nwfp_shp)
-            except (KeyError, TypeError, ValueError):
-                pass
+        if plot_lon_f is not None and plot_lat_f is not None:
+            reg = region or ""
+            if reg == "pacific northwest":
+                pv = sample_r5_paz_value(plot_lon_f, plot_lat_f, paz_tif)
+                if pv is not None:
+                    pnw_paz = int(round(float(pv)))
+                pnw_or_counties = oregon_plot_in_counties_layer(plot_lon_f, plot_lat_f, or_shp)
+            if reg in ("pacific northwest", "pacific southwest"):
+                pnw_inside = plot_inside_nwfp(plot_lon_f, plot_lat_f, nwfp_shp)
 
         sdi_rmrs: float | None = None
         if "SDI_RMRS" in g.columns:
@@ -328,9 +404,11 @@ def mog_condition_scores(
                 except (TypeError, ValueError):
                     sdi_rmrs = None
 
+        plot_elev_ft = plot_elev_by_cn.get(plt_cn)
+
         ctx = ConditionContext(
             region=region or "",
-            forest_type=int(c["FLDTYPCD"]),
+            forest_type=_mog_forest_type_from_cond_row(c, region=region),
             condition_area_acres=condition_area,
             stand_age=stand_age,
             trees=g,
@@ -351,26 +429,43 @@ def mog_condition_scores(
             pnw_woody_debris=pnw_woody,
             pnw_site_class_max=pnw_site_max,
             pnw_plot_in_or_counties_layer=pnw_or_counties,
+            plot_elev_ft=plot_elev_ft,
+            plot_lon=plot_lon_f,
         )
 
         mog_vec = engine.mog_vector(ctx)
         mog_score = max(mog_vec, default=0.0)
+        og_flag = float(engine.old_growth_flag(ctx))
 
         if _region_is_southwest(region):
-            diag = southwest_og_diagnostic_row(ctx)
+            diag = dict(_mog_diag_na)
+            diag.update(southwest_og_diagnostic_row(ctx))
             if len(mog_vec) > 1:
-                diag = {**diag, "SW_MATURITY_SCORE": float(max(mog_vec[1:]))}
+                diag["SW_MATURITY_SCORE"] = float(max(mog_vec[1:]))
             else:
-                diag = {**diag, "SW_MATURITY_SCORE": pd.NA}
+                diag["SW_MATURITY_SCORE"] = pd.NA
+        elif _region_is_northern(region):
+            diag = dict(_mog_diag_na)
+            diag.update(northern_veg_diagnostic_row(ctx, mog_vec))
         else:
-            diag = dict(sw_diag_na)
+            diag = dict(_mog_diag_na)
+
+        statecd_out = c.get("STATECD")
+        if statecd_out is not None and not pd.isna(statecd_out):
+            try:
+                statecd_out = int(statecd_out)
+            except (TypeError, ValueError):
+                pass
 
         out.append(
             {
                 "PLT_CN": plt_cn,
                 "CONDID": condid,
+                "STATECD": statecd_out,
+                "COND_STATUS_CD": _to_int_or_na(c.get("COND_STATUS_CD")),
+                "FORTYPCD": _to_int_or_na(c.get("FORTYPCD")),
                 "MOG_SCORE": float(mog_score),
-                "OG_FLAG": _og_flag_for_condition(region, mog_vec),
+                "OG_FLAG": og_flag,
                 "AREA_BASIS": c.get("PROP_BASIS"),
                 "CONDPROP_UNADJ": float(c.get("CONDPROP_UNADJ", 0.0) or 0.0),
                 "PROP_FOREST": float(c.get("PROP_FOREST", 0.0) or 0.0),
@@ -405,8 +500,9 @@ def old_growth_area(
         OG_PROP = PROP_FOREST * OG_FLAG
 
     where ``PROP_FOREST`` is ``CONDPROP_UNADJ × landD`` (same as ``area`` / ``tpa``),
-    and ``OG_FLAG`` is **old-growth only** (see :func:`mog_condition_scores`: for
-    **southwest**, the first MOG vector element—Table 9—not ``max(vector)==1``).
+    and ``OG_FLAG`` is **old-growth only** (regional OG criteria via
+    :meth:`fia_mog.engine.MOGEngine.old_growth_flag`, not ``max(MOG.vector)`` from
+    maturity alone).
 
     This sums to plot level (with non-response adjustment by AREA_BASIS),
     then is expanded to area totals by the design frame inside `custom_pse`.

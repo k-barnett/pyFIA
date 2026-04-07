@@ -91,7 +91,11 @@ def _quaking_aspen_large(trees: pd.DataFrame) -> pd.DataFrame:
     return pd.concat([asp, con]).drop_duplicates()
 
 
-def psw_mog_vector(ctx: "ConditionContext", metrics: "TreeMetrics") -> List[float]:
+def pacific_southwest_og_vector(ctx: "ConditionContext") -> List[float]:
+    """
+    Table 12 binary OG components only (no Table 19 maturity). Empty when ``veg`` is missing.
+    """
+
     trees = ctx.trees
     acres = float(ctx.condition_area_acres)
     stand_age = float(ctx.stand_age)
@@ -117,9 +121,8 @@ def psw_mog_vector(ctx: "ConditionContext", metrics: "TreeMetrics") -> List[floa
 
     nwfp_inside = ctx.pnw_inside_nwfp
 
-    # --- Table 12 old growth (requires mapped ``veg.type``; R leaves veg NA otherwise) ---
     if not veg:
-        return list(_psw_mature_vector(None, None, ft, metrics))
+        return vec
 
     if veg == "coast redwood":
         dia = pd.to_numeric(trees["DIA"], errors="coerce")
@@ -205,6 +208,22 @@ def psw_mog_vector(ctx: "ConditionContext", metrics: "TreeMetrics") -> List[floa
     if veg == "ponderosa pine" and pond == "pacific":
         vec.append(_pair_og(trees, acres, stand_age, dia_min=30.0, trees_per_acre_min=9.0, age_min=125.0))
 
+    return vec
+
+
+def psw_mog_vector(ctx: "ConditionContext", metrics: "TreeMetrics") -> List[float]:
+    trees = ctx.trees
+    ft = int(ctx.forest_type)
+
+    veg = pacific_southwest_veg_type(ft)
+    pond: str | None = None
+    if veg == "ponderosa pine":
+        pond = pacific_southwest_ponderosa_ecosub_class(ctx.ecosubcd)
+
+    if not veg:
+        return list(_psw_mature_vector(None, None, ft, metrics))
+
+    vec = pacific_southwest_og_vector(ctx)
     last_og = vec[-1] if vec else 0.0
     out = list(vec)
 

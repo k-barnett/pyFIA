@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import shutil
+import sqlite3
 import tempfile
+from contextlib import closing
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, Iterable, List, Mapping, Optional, Sequence
+from typing import Dict, Iterable, List, Mapping, Optional, Sequence, Set
 
 import pandas as pd
 import requests
@@ -12,6 +14,31 @@ from tqdm import tqdm
 
 
 FIA_BASE_URL = "https://apps.fs.usda.gov/fia/datamart/CSV"
+
+# Default table subset for ``read_fia(..., common=True)`` (CSV or SQLite).
+READ_FIA_COMMON_TABLES: Set[str] = {
+    "COND",
+    "COND_DWM_CALC",
+    "INVASIVE_SUBPLOT_SPP",
+    "PLOT",
+    "POP_ESTN_UNIT",
+    "POP_EVAL",
+    "POP_EVAL_GRP",
+    "POP_EVAL_TYP",
+    "POP_PLOT_STRATUM_ASSGN",
+    "POP_STRATUM",
+    "SUBPLOT",
+    "TREE",
+    "TREE_GRM_COMPONENT",
+    "TREE_GRM_MIDPT",
+    "TREE_GRM_BEGIN",
+    "SUBP_COND_CHNG_MTRX",
+    "SEEDLING",
+    "SURVEY",
+    "SUBP_COND",
+    "P2VEG_SUBP_STRUCTURE",
+    "PLOTGEOM",
+}
 
 # List of known table names, ported from rFIA::getFIA
 KNOWN_TABLES: List[str] = [
@@ -382,21 +409,72 @@ def get_fia(
     return FiaDatabase(merged)
 
 
+def _sqlite_quote_ident(name: str) -> str:
+    """Double-quote a SQLite identifier (table or view name)."""
+    return '"' + name.replace('"', '""') + '"'
+
+
+def _read_fia_sqlite(
+    path: Path,
+    tables: Optional[Sequence[str]],
+    common: bool,
+) -> FiaDatabase:
+    """Load selected FIADB tables from a SQLite file into a :class:`FiaDatabase`."""
+    with closing(sqlite3.connect(str(path))) as conn:
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT name FROM sqlite_master WHERE type IN ('table', 'view') "
+            "AND name NOT LIKE 'sqlite_%' ORDER BY name"
+        )
+        raw_names = [row[0] for row in cur.fetchall()]
+
+        by_upper: Dict[str, str] = {}
+        for n in raw_names:
+            u = n.upper()
+            if u not in by_upper:
+                by_upper[u] = n
+
+        if tables is not None:
+            wanted = {t.upper() for t in tables}
+        elif common:
+            wanted = set(READ_FIA_COMMON_TABLES)
+        else:
+            wanted = set(by_upper.keys()).intersection({t.upper() for t in KNOWN_TABLES})
+
+        tables_dict: Dict[str, pd.DataFrame] = {}
+        for logical in sorted(wanted):
+            if logical not in by_upper:
+                continue
+            real = by_upper[logical]
+            q = _sqlite_quote_ident(real)
+            df = pd.read_sql_query(f"SELECT * FROM {q}", conn, dtype_backend="pyarrow")
+            if logical in tables_dict:
+                tables_dict[logical] = pd.concat(
+                    [tables_dict[logical], df], ignore_index=True
+                )
+            else:
+                tables_dict[logical] = df
+
+    return FiaDatabase(tables_dict)
+
+
 def read_fia(
     dir: str,
     tables: Optional[Sequence[str]] = None,
     common: bool = True,
 ) -> FiaDatabase:
     """
-    Read FIA CSV files from a local directory into a `FiaDatabase`.
+    Read FIA data into a :class:`FiaDatabase` from CSV files or a SQLite FIADB.
 
-    This is a partial port of `rFIA::readFIA` for the in-memory CSV case.
+    This is a partial port of `rFIA::readFIA` for the in-memory case.
 
     Parameters
     ----------
     dir:
-        Directory containing FIA CSV files, typically downloaded via `get_fia`
-        or manually from the FIA Datamart.
+        Path to a **directory** of FIA CSV files (Datamart extract), **or** a path
+        to a **SQLite** FIADB file (``.sqlite``, ``.db``, etc.). If ``dir`` is a
+        file, it is opened with :mod:`sqlite3`; if that fails, a :exc:`ValueError`
+        is raised.
     tables:
         Optional sequence of table base names (e.g. ['PLOT', 'TREE']). If
         omitted and `common=True`, a default "common" subset will be loaded.
@@ -407,7 +485,18 @@ def read_fia(
 
     path = Path(dir).expanduser().absolute()
     if not path.exists():
-        raise FileNotFoundError(f"Directory {path} does not exist.")
+        raise FileNotFoundError(f"Path does not exist: {path}")
+
+    if path.is_file():
+        try:
+            return _read_fia_sqlite(path, tables=tables, common=common)
+        except sqlite3.DatabaseError as e:
+            raise ValueError(
+                f"Could not read SQLite FIADB at {path}: {e}"
+            ) from e
+
+    if not path.is_dir():
+        raise NotADirectoryError(f"Expected a directory or SQLite file: {path}")
 
     csv_files = sorted(p for p in path.iterdir() if p.suffix.lower() == ".csv")
     if not csv_files:
@@ -426,35 +515,10 @@ def read_fia(
 
     base_names_set = {b.upper() for b in base_names}
 
-    # Common tables, ported from rFIA::readFIA
-    common_tables = {
-        "COND",
-        "COND_DWM_CALC",
-        "INVASIVE_SUBPLOT_SPP",
-        "PLOT",
-        "POP_ESTN_UNIT",
-        "POP_EVAL",
-        "POP_EVAL_GRP",
-        "POP_EVAL_TYP",
-        "POP_PLOT_STRATUM_ASSGN",
-        "POP_STRATUM",
-        "SUBPLOT",
-        "TREE",
-        "TREE_GRM_COMPONENT",
-        "TREE_GRM_MIDPT",
-        "TREE_GRM_BEGIN",
-        "SUBP_COND_CHNG_MTRX",
-        "SEEDLING",
-        "SURVEY",
-        "SUBP_COND",
-        "P2VEG_SUBP_STRUCTURE",
-        "PLOTGEOM",
-    }
-
     if tables is not None:
         wanted = {t.upper() for t in tables}
     elif common:
-        wanted = common_tables
+        wanted = set(READ_FIA_COMMON_TABLES)
     else:
         wanted = base_names_set.intersection({t.upper() for t in KNOWN_TABLES})
 

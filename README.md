@@ -55,7 +55,7 @@ from fia import (
   - If the expected CSV for a requested state/table (e.g. **`AZ_PLOT.csv`**) already exists in **`dir`**, that table is **not** re-downloaded; **`get_fia`** prints a skip message. With **`load=True`**, it still loads from the existing file.
 
 - **`read_fia(dir, tables=None, common=True)`**
-  - Reads FIA CSVs from a local directory into a **`FiaDatabase`**.
+  - Reads into a **`FiaDatabase`** from either a **directory of CSVs** (Datamart-style names such as **`AZ_PLOT.csv`**) **or** a **SQLite FIADB file** path (e.g. **`.sqlite`** / **`.db`**). If **`dir`** points to a file, it is opened with **`sqlite3`**; table and view names are matched case-insensitively and stored under **uppercase** keys like **`PLOT`**, **`TREE`**.
   - Supports selecting a specific list of tables (**`tables`**) or a common subset when **`common=True`** (similar to **`readFIA(..., common=TRUE)`** in R).
 
 #### Database clipping
@@ -98,6 +98,40 @@ tpa(
 - **`tree_list=True`**: per-tree rows with **`PLT_CN`**, **`CONDID`**, **`SUBP`**, **`TREE`**, **`YEAR`**, **`TPA`**, **`BAA`**, **`PROP_FOREST`** (and related columns as implemented).
 
 With POP design tables, uses a **TI design-based pipeline** (stratum → estimation unit → totals and variances): **`TPA`**, **`BAA`**, **`TREE_TOTAL`**, **`BA_TOTAL`**, **`AREA_TOTAL`**, variance / SE columns, and **`nPlots_*`**, **`N`**. Without POP tables, falls back to a simple plot-mean estimator.
+
+##### **`cond_height_percentiles`** — height percentiles by plot–condition
+
+```python
+cond_height_percentiles(
+    db,
+    land_type="forest",
+    tree_type="live",
+    percentile_method="raw",
+    weight_by="tpa",
+    percentiles=(5, 25, 50, 75, 95),
+)
+```
+
+- One row per **`(PLT_CN, CONDID, YEAR)`** with **`n_trees`** and columns **`HT_P{p}`** for each requested percentile (heights in feet per **`TREE.HT`**).
+- **`tree_type`**: **`"all"`**, **`"live"`**, or **`"dead"`** (same domain flags as **`tpa`** via **`tDI`**).
+- **`percentile_method`**: **`"raw"`** (unweighted over in-domain trees) or **`"weighted"`** (cumulative-weight interpolation as in the internal **`_weighted_percentile`** helper).
+- **`weight_by`** (weighted only): **`"tpa"`** or **`"baa"`** using the same tree-level **`TPA`** / **`BAA`** contributions as **`tpa`** (i.e. **`TPA_UNADJ × tDI`** and **`basal_area × TPA_UNADJ × tDI`**).
+
+##### **`cond_mean_crown_ratio`** — mean crown ratio by plot–condition
+
+```python
+cond_mean_crown_ratio(
+    db,
+    land_type="forest",
+    tree_type="live",
+    weight_by="tpa",
+    weighted=True,
+)
+```
+
+- One row per **`(PLT_CN, CONDID, YEAR)`** with **`n_trees`** and **`mean_crown_ratio`** ( **`TREE.CR`** as a **0–1 proportion**: FIADB’s usual **0–100** crown ratio is divided by 100).
+- **`land_type`** / **`tree_type`**: same domains as **`cond_height_percentiles`** (**`"all"`**, **`"live"`**, **`"dead"`** for trees).
+- **`weighted=True`** (default): **`numpy.average(CR, weights=…)`** with **`weight_by="tpa"`** or **`"baa"`** (same tree-level weights as **`tpa`**). **`weighted=False`**: simple mean of **`CR`** over in-domain trees, still scaled to proportion.
 
 ##### **`area`** — land area and percentage of area
 
@@ -155,7 +189,7 @@ Implementation package: **`fia_mog`** (sibling of **`fia`**). Auxiliary tables a
 
 **Note (Southwest Table 9 QMD, live trees ≥ 10 in):** **`FUNCTION_mapMOG.R`** uses a **non-standard** basal term ``π × (DIA/24) × 2`` (linear in DBH) and, in the QMD ratio, **sample stem density** ``nrow / condition.area`` while the numerator uses **expanded** ``TPA_UNADJ``. **`fia_mog.southwest`** follows **conventional** FIA-style QMD: basal area per tree ``π × (DIA/24)²`` ft² (DBH in inches), basal area per acre ``Σ(TPA_UNADJ × BA_tree)``, then ``QMD = sqrt((BA_ac / ΣTPA_UNADJ) / 0.005454)``—the same structure as typical OFE/MOG R helpers that use ``sum(TPA_UNADJ)`` in the denominator. This **differs from bundled mapMOG** but matches standard BA–TPA–QMD algebra; OG flags use **full precision** (no ``round(..., 1)``).
 
-**Note (Southwest `OG_PROP` / `OG_FLAG`):** The MOG vector is **old-growth first, then Table 19 maturity** (same pattern as R). Maturity components are weighted scores that can reach **1.0** when every criterion is met. Using `max(MOG.vector) == 1` for old-growth **area** therefore counts **mature** forest as old growth. For **Region 3 (southwest)** only, **`mog_condition_scores`** sets **`OG_FLAG`** from the **first** vector element (Table 9 binary OG). **`MOG_SCORE`** remains the max of the full vector for diagnostics. Other regions still use the legacy `max == 1` rule and may need the same split if you rely on their **`OG_PROP`** totals.
+**Note (`OG_PROP` / `OG_FLAG`):** The MOG vector is **old-growth first, then Table 19 maturity** (same pattern as R). Maturity components are weighted scores that can reach **1.0** when every criterion is met. **`mog_condition_scores`** sets **`OG_FLAG`** from **regional OG rules only** (Table 9 / 11 / 12 / 13–14 as implemented in **`fia_mog.engine`**) via **`MOGEngine.old_growth_flag`**, so a stand that is **mature but not OG** does **not** get **`OG_PROP`** credit. **`MOG_SCORE`** remains the **max** of the full vector (maturity can still drive it to **1.0** for diagnostics).
 
 **If `OG_PROP` totals do not change after updating this logic:** Python may be using a **cached** `fia_mog.estimators` (e.g. Jupyter imported `fia` before editing the repo, or `import fia` bound `old_growth_area` from an older install). **Restart the kernel** or run `import importlib, fia_mog.estimators as e; importlib.reload(e)` (and reload `fia` if you use `from fia import old_growth_area`). Prefer **`from fia_mog.estimators import old_growth_area`** or **`from fia.data_io import …`** / **`from fia.clip import clip_fia`** so **`fia.__init__`** does not pin an old MOG binding; **`scripts/test_mog_area.py`** follows that pattern.
 

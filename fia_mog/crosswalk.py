@@ -371,11 +371,23 @@ STATECD_TO_ST_ABBREV: dict[int, str] = {
 }
 
 
-def statecd_to_abbrev(statecd: int | float | None) -> str | None:
-    if statecd is None or (isinstance(statecd, float) and np.isnan(statecd)):
+def statecd_to_abbrev(statecd: int | float | str | None) -> str | None:
+    """Map FIA ``STATECD`` (numeric or string from CSV) to a two-letter abbreviation."""
+
+    if statecd is None:
         return None
     try:
-        k = int(statecd)
+        if pd.isna(statecd):
+            return None
     except (TypeError, ValueError):
+        pass
+    if isinstance(statecd, float) and np.isnan(statecd):
+        return None
+    num = pd.to_numeric(statecd, errors="coerce")
+    if pd.isna(num):
+        return None
+    try:
+        k = int(num)
+    except (TypeError, ValueError, OverflowError):
         return None
     return STATECD_TO_ST_ABBREV.get(k)

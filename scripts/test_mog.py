@@ -18,6 +18,7 @@ import pandas as pd
 
 from fia import FiaDatabase, clip_fia, read_fia
 from fia_mog import ConditionContext, MOGEngine, classify_region
+from fia_mog.estimators import _mog_forest_type_from_cond_row
 
 
 def compute_mog_for_arizona(db: FiaDatabase) -> pd.DataFrame:
@@ -32,11 +33,16 @@ def compute_mog_for_arizona(db: FiaDatabase) -> pd.DataFrame:
     conds = db["COND"].copy()
     trees = db["TREE"].copy()
 
-    # Arizona forest, accessible conditions with forest type code
+    fld_az = pd.to_numeric(conds["FLDTYPCD"], errors="coerce")
+    fort_az = (
+        pd.to_numeric(conds["FORTYPCD"], errors="coerce")
+        if "FORTYPCD" in conds.columns
+        else pd.Series(pd.NA, index=conds.index)
+    )
     conds_az = conds[
         (conds["STATECD"] == 4)
         & (conds["COND_STATUS_CD"] == 1)
-        & (~conds["FLDTYPCD"].isna())
+        & (fld_az.notna() | fort_az.notna())
     ].copy()
 
     # Join condition-level fields we need onto the tree table:
@@ -49,6 +55,7 @@ def compute_mog_for_arizona(db: FiaDatabase) -> pd.DataFrame:
         "PROP_BASIS",
         "CONDPROP_UNADJ",
         "FLDTYPCD",
+        "FORTYPCD",
         "STDAGE",
         "FLDAGE",
         "SITECLCD",
@@ -88,7 +95,7 @@ def compute_mog_for_arizona(db: FiaDatabase) -> pd.DataFrame:
         ages = [float(a) for a in ages if pd.notna(a)]
         stand_age = max(ages) if ages else 0.0
 
-        forest_type = int(c["FLDTYPCD"])
+        forest_type = _mog_forest_type_from_cond_row(c, region=region)
 
         # Safely coerce ADFORCD and SITECLCD
         adforcd_val = c["ADFORCD"]
@@ -152,10 +159,16 @@ def compute_mog_for_montana(db: FiaDatabase) -> pd.DataFrame:
     conds = db["COND"].copy()
     trees = db["TREE"].copy()
 
+    fld_mt = pd.to_numeric(conds["FLDTYPCD"], errors="coerce")
+    fort_mt = (
+        pd.to_numeric(conds["FORTYPCD"], errors="coerce")
+        if "FORTYPCD" in conds.columns
+        else pd.Series(pd.NA, index=conds.index)
+    )
     conds_mt = conds[
         (conds["STATECD"] == 30)
         & (conds["COND_STATUS_CD"] == 1)
-        & (~conds["FLDTYPCD"].isna())
+        & (fld_mt.notna() | fort_mt.notna())
     ].copy()
 
     cond_cols_for_trees = [
@@ -165,12 +178,14 @@ def compute_mog_for_montana(db: FiaDatabase) -> pd.DataFrame:
         "PROP_BASIS",
         "CONDPROP_UNADJ",
         "FLDTYPCD",
+        "FORTYPCD",
         "STDAGE",
         "FLDAGE",
         "SITECLCD",
         "ADFORCD",
         "STATECD",
     ]
+    cond_cols_for_trees = [c for c in cond_cols_for_trees if c in conds_mt.columns]
     trees_mt = trees.merge(
         conds_mt[cond_cols_for_trees],
         on=["PLT_CN", "CONDID"],
@@ -199,7 +214,7 @@ def compute_mog_for_montana(db: FiaDatabase) -> pd.DataFrame:
         ages = [float(a) for a in ages if pd.notna(a)]
         stand_age = max(ages) if ages else 0.0
 
-        forest_type = int(c["FLDTYPCD"])
+        forest_type = _mog_forest_type_from_cond_row(c, region=region)
 
         adforcd_val = c["ADFORCD"]
         adforcd_int = None if pd.isna(adforcd_val) else int(adforcd_val)

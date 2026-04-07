@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Callable, Iterable, List, Mapping, Optional, Sequence
 
+import numpy as np
 import pandas as pd
 
 from .data_io import FiaDatabase
@@ -77,6 +78,41 @@ def _tree_type_domain(
         raise NotImplementedError(
             f"tree_type='{tree_type}' is not yet supported in the Python port."
         )
+
+
+def _weighted_percentile(
+    values: np.ndarray, weights: np.ndarray, percentiles: list[float]
+) -> np.ndarray:
+    """Compute weighted percentiles using linear interpolation."""
+    values = np.asarray(values, dtype=float)
+    weights = np.asarray(weights, dtype=float)
+    ok = np.isfinite(values) & np.isfinite(weights) & (weights > 0)
+    values = values[ok]
+    weights = weights[ok]
+    if values.size == 0:
+        return np.full(len(percentiles), np.nan)
+    idx = np.argsort(values)
+    values = values[idx]
+    weights = weights[idx]
+    cum_w = np.cumsum(weights)
+    denom = cum_w[-1]
+    if denom <= 0:
+        return np.full(len(percentiles), np.nan)
+    cum_w_norm = (cum_w - 0.5 * weights) / denom
+    return np.interp(np.asarray(percentiles, dtype=float) / 100.0, cum_w_norm, values)
+
+
+def _raw_percentile(values: np.ndarray, percentiles: Sequence[float]) -> np.ndarray:
+    """Ordinary (unweighted) percentiles with linear interpolation."""
+    values = np.asarray(values, dtype=float)
+    values = values[np.isfinite(values)]
+    if values.size == 0:
+        return np.full(len(percentiles), np.nan)
+    return np.percentile(values, np.asarray(percentiles, dtype=float))
+
+
+def _ht_percentile_column_name(p: float) -> str:
+    return f"HT_P{p:g}"
 
 
 def area(
@@ -1747,5 +1783,298 @@ def tpa(
     return out
 
 
-__all__ = ["area", "custom_pse", "tpa"]
+def cond_height_percentiles(
+    db: FiaDatabase,
+    *,
+    land_type: str = "forest",
+    tree_type: str = "live",
+    percentile_method: str = "raw",
+    weight_by: str = "tpa",
+    percentiles: Sequence[float] = (5.0, 25.0, 50.0, 75.0, 95.0),
+) -> pd.DataFrame:
+    """
+    Height percentiles by plot and condition (``PLT_CN``, ``CONDID``).
+
+    Uses the same plot / land / tree domain logic as :func:`tpa`: trees on
+    current status‑1 plots, with ``land_type`` defining condition inclusion and
+    ``tree_type`` restricting to all, live, or dead trees. Rows with
+    ``TPA_UNADJ <= 0`` are dropped. Tree-level weights for the weighted method
+    match :func:`tpa` tree-list contributions: ``TPA_UNADJ × tDI`` and
+    ``basal_area(DIA) × TPA_UNADJ × tDI``, where ``tDI = landD × typeD``.
+
+    Parameters
+    ----------
+    land_type:
+        ``"forest"``, ``"timber"``, or ``"all"`` (same as ``tpa``).
+    tree_type:
+        ``"all"``, ``"live"``, or ``"dead"`` only (other values are rejected for
+        this function).
+    percentile_method:
+        ``"raw"`` for unweighted percentiles over tree heights in domain, or
+        ``"weighted"`` using ``_weighted_percentile`` (linear interpolation on
+        cumulative normalized weights).
+    weight_by:
+        When ``percentile_method="weighted"``: ``"tpa"`` or ``"baa"`` for the
+        tree-level weight column above. Ignored when ``percentile_method="raw"``.
+    percentiles:
+        Percentile levels on the 0–100 scale (e.g. ``50`` for the median).
+
+    Returns
+    -------
+    DataFrame with ``PLT_CN``, ``CONDID``, ``YEAR``, ``n_trees``, and one column
+    per requested percentile named ``HT_P{p}`` (e.g. ``HT_P50``).
+    """
+
+    tree_type = tree_type.lower()
+    if tree_type not in ("all", "live", "dead"):
+        raise ValueError(
+            "cond_height_percentiles: tree_type must be 'all', 'live', or 'dead'."
+        )
+    percentile_method = percentile_method.lower()
+    if percentile_method not in ("raw", "weighted"):
+        raise ValueError(
+            "cond_height_percentiles: percentile_method must be 'raw' or 'weighted'."
+        )
+    weight_by = weight_by.lower()
+    if percentile_method == "weighted" and weight_by not in ("tpa", "baa"):
+        raise ValueError(
+            "cond_height_percentiles: weight_by must be 'tpa' or 'baa' when "
+            "percentile_method='weighted'."
+        )
+
+    pct_list = [float(p) for p in percentiles]
+    if not pct_list:
+        raise ValueError("cond_height_percentiles: percentiles must be non-empty.")
+
+    required = {"PLOT", "COND", "TREE"}
+    missing = required.difference(set(db.keys()))
+    if missing:
+        raise ValueError(
+            "Missing required tables in `db` for cond_height_percentiles(): "
+            + ", ".join(sorted(missing))
+        )
+
+    plot = db["PLOT"].copy()
+    cond = db["COND"].copy()
+    tree = db["TREE"].copy()
+
+    for col in ["PLT_CN", "INVYR", "PLOT_STATUS_CD"]:
+        if col not in plot.columns:
+            raise ValueError(f"`PLOT` table must contain column '{col}'.")
+    for col in ["PLT_CN", "CONDID", "COND_STATUS_CD", "CONDPROP_UNADJ", "SITECLCD", "RESERVCD"]:
+        if col not in cond.columns:
+            raise ValueError(f"`COND` table must contain column '{col}'.")
+    for col in ["PLT_CN", "CONDID", "DIA", "TPA_UNADJ", "STATUSCD", "TREECLCD", "HT"]:
+        if col not in tree.columns:
+            raise ValueError(f"`TREE` table must contain column '{col}'.")
+
+    plot = plot.loc[plot["PLOT_STATUS_CD"] == 1].copy()
+
+    cond["landD"] = _land_type_domain(
+        land_type,
+        cond["COND_STATUS_CD"],
+        cond["SITECLCD"],
+        cond["RESERVCD"],
+    )
+    tree["typeD"] = _tree_type_domain(
+        tree_type,
+        tree["STATUSCD"],
+        tree["DIA"],
+        tree["TREECLCD"],
+    )
+
+    data = (
+        plot.merge(cond, on="PLT_CN", how="inner", suffixes=("", "_COND"))
+        .merge(tree, on=["PLT_CN", "CONDID"], how="inner", suffixes=("", "_TREE"))
+    )
+    data = data[data["TPA_UNADJ"].fillna(0) > 0].copy()
+
+    data["tDI"] = data["landD"] * data["typeD"]
+
+    dia = pd.to_numeric(data["DIA"], errors="coerce")
+    tpa_unadj = pd.to_numeric(data["TPA_UNADJ"], errors="coerce").fillna(0.0)
+    work = data.assign(
+        TPA=lambda d: tpa_unadj * d["tDI"],
+        BAA=lambda d: _basal_area(dia) * tpa_unadj * d["tDI"],
+        YEAR=lambda d: d["MEASYEAR"] if "MEASYEAR" in d.columns else d["INVYR"],
+    )
+
+    def _one_group(g: pd.DataFrame) -> pd.Series:
+        ht = pd.to_numeric(g["HT"], errors="coerce")
+        tdi = g["tDI"].to_numpy(dtype=float)
+        htn = ht.to_numpy(dtype=float)
+        m = (tdi > 0) & np.isfinite(htn)
+        n_trees = int(np.sum(m))
+        col_names = [_ht_percentile_column_name(p) for p in pct_list]
+        if n_trees == 0:
+            return pd.Series(
+                {"n_trees": 0, **{c: np.nan for c in col_names}},
+            )
+        htv = htn[m]
+        if percentile_method == "raw":
+            vals = _raw_percentile(htv, pct_list)
+        else:
+            if weight_by == "tpa":
+                w = g["TPA"].to_numpy(dtype=float)[m]
+            else:
+                w = g["BAA"].to_numpy(dtype=float)[m]
+            vals = _weighted_percentile(htv, w, pct_list)
+        return pd.Series(
+            {"n_trees": n_trees, **dict(zip(col_names, vals))},
+        )
+
+    out = (
+        work.groupby(["PLT_CN", "CONDID", "YEAR"], sort=False)
+        .apply(_one_group)
+        .reset_index()
+    )
+    return out
+
+
+def cond_mean_crown_ratio(
+    db: FiaDatabase,
+    *,
+    land_type: str = "forest",
+    tree_type: str = "live",
+    weight_by: str = "tpa",
+    weighted: bool = True,
+) -> pd.DataFrame:
+    """
+    Mean crown ratio by plot and condition (``PLT_CN``, ``CONDID``).
+
+    Uses ``TREE.CR`` with the same plot / land / tree domain logic as
+    :func:`tpa` and :func:`cond_height_percentiles`. FIADB typically stores
+    crown ratio as a percentage (0–100); this function returns
+    **``mean_crown_ratio``** on a **0–1 scale** (values are divided by 100),
+    matching ``np.average(cr, weights=...) / 100.0``.
+
+    Tree-level weights (when ``weighted=True``) are the same as :func:`tpa`
+    tree-list contributions — ``TPA_UNADJ × tDI`` or
+    ``basal_area(DIA) × TPA_UNADJ × tDI`` — with ``tDI = landD × typeD``, so
+    land and tree-type domains apply to both ``CR`` and the weights.
+
+    Parameters
+    ----------
+    land_type:
+        ``"forest"``, ``"timber"``, or ``"all"`` (same as ``tpa``).
+    tree_type:
+        ``"all"``, ``"live"``, or ``"dead"`` only.
+    weight_by:
+        When ``weighted=True``: ``"tpa"`` or ``"baa"`` for the weight column.
+    weighted:
+        If ``True`` (default), use :func:`numpy.average` with tree-level weights.
+        If ``False``, use an unweighted mean of ``CR`` over in-domain trees (still
+        converted to proportion via ``/ 100``).
+
+    Returns
+    -------
+    DataFrame with ``PLT_CN``, ``CONDID``, ``YEAR``, ``n_trees``, and
+    ``mean_crown_ratio``.
+    """
+
+    tree_type = tree_type.lower()
+    if tree_type not in ("all", "live", "dead"):
+        raise ValueError(
+            "cond_mean_crown_ratio: tree_type must be 'all', 'live', or 'dead'."
+        )
+    weight_by = weight_by.lower()
+    if weighted and weight_by not in ("tpa", "baa"):
+        raise ValueError(
+            "cond_mean_crown_ratio: weight_by must be 'tpa' or 'baa' when weighted=True."
+        )
+
+    required = {"PLOT", "COND", "TREE"}
+    missing = required.difference(set(db.keys()))
+    if missing:
+        raise ValueError(
+            "Missing required tables in `db` for cond_mean_crown_ratio(): "
+            + ", ".join(sorted(missing))
+        )
+
+    plot = db["PLOT"].copy()
+    cond = db["COND"].copy()
+    tree = db["TREE"].copy()
+
+    for col in ["PLT_CN", "INVYR", "PLOT_STATUS_CD"]:
+        if col not in plot.columns:
+            raise ValueError(f"`PLOT` table must contain column '{col}'.")
+    for col in ["PLT_CN", "CONDID", "COND_STATUS_CD", "CONDPROP_UNADJ", "SITECLCD", "RESERVCD"]:
+        if col not in cond.columns:
+            raise ValueError(f"`COND` table must contain column '{col}'.")
+    for col in ["PLT_CN", "CONDID", "DIA", "TPA_UNADJ", "STATUSCD", "TREECLCD", "CR"]:
+        if col not in tree.columns:
+            raise ValueError(f"`TREE` table must contain column '{col}'.")
+
+    plot = plot.loc[plot["PLOT_STATUS_CD"] == 1].copy()
+
+    cond["landD"] = _land_type_domain(
+        land_type,
+        cond["COND_STATUS_CD"],
+        cond["SITECLCD"],
+        cond["RESERVCD"],
+    )
+    tree["typeD"] = _tree_type_domain(
+        tree_type,
+        tree["STATUSCD"],
+        tree["DIA"],
+        tree["TREECLCD"],
+    )
+
+    data = (
+        plot.merge(cond, on="PLT_CN", how="inner", suffixes=("", "_COND"))
+        .merge(tree, on=["PLT_CN", "CONDID"], how="inner", suffixes=("", "_TREE"))
+    )
+    data = data[data["TPA_UNADJ"].fillna(0) > 0].copy()
+
+    data["tDI"] = data["landD"] * data["typeD"]
+
+    dia = pd.to_numeric(data["DIA"], errors="coerce")
+    tpa_unadj = pd.to_numeric(data["TPA_UNADJ"], errors="coerce").fillna(0.0)
+    work = data.assign(
+        TPA=lambda d: tpa_unadj * d["tDI"],
+        BAA=lambda d: _basal_area(dia) * tpa_unadj * d["tDI"],
+        YEAR=lambda d: d["MEASYEAR"] if "MEASYEAR" in d.columns else d["INVYR"],
+    )
+
+    def _one_group(g: pd.DataFrame) -> pd.Series:
+        cr = pd.to_numeric(g["CR"], errors="coerce")
+        tdi = g["tDI"].to_numpy(dtype=float)
+        crv = cr.to_numpy(dtype=float)
+        valid = (tdi > 0) & np.isfinite(crv)
+        n_trees = int(np.sum(valid))
+        if n_trees == 0:
+            return pd.Series({"n_trees": 0, "mean_crown_ratio": np.nan})
+        cr_use = crv[valid]
+        if weighted:
+            if weight_by == "tpa":
+                w = g["TPA"].to_numpy(dtype=float)[valid]
+            else:
+                w = g["BAA"].to_numpy(dtype=float)[valid]
+            if not np.any(np.isfinite(w)) or float(np.nansum(w)) <= 0.0:
+                return pd.Series({"n_trees": n_trees, "mean_crown_ratio": np.nan})
+            mean_pct = float(np.average(cr_use, weights=w))
+        else:
+            mean_pct = float(np.mean(cr_use))
+        return pd.Series(
+            {
+                "n_trees": n_trees,
+                "mean_crown_ratio": mean_pct / 100.0,
+            }
+        )
+
+    out = (
+        work.groupby(["PLT_CN", "CONDID", "YEAR"], sort=False)
+        .apply(_one_group)
+        .reset_index()
+    )
+    return out
+
+
+__all__ = [
+    "area",
+    "cond_height_percentiles",
+    "cond_mean_crown_ratio",
+    "custom_pse",
+    "tpa",
+]
 

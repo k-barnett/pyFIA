@@ -7,6 +7,7 @@ VEG prefix rules and habitat letter tables live alongside this module under
 
 from __future__ import annotations
 
+import math
 from typing import Any
 
 import numpy as np
@@ -23,6 +24,11 @@ NORTHERN_KEEP_VEG_PREFIXES: frozenset[str] = frozenset(
     UBO THOC GAGE JUSC MARE SYOC PSSP PIPO PIAB PIBR PIEN PIGL PIMA PIPU PIRU PISI PIOM
     """.split()
 )
+
+# If GIS divide polygons are unavailable: plots with longitude >= this value (less negative
+# than the Rockies front) are treated as the eastern Montana MOG zone; west → western zone.
+# Approximate coarse split (~110.5°W); prefer :func:`montana_plot_in_cont_divide_east` when possible.
+_MT_LON_HEURISTIC_EASTERN_IF_GTE: float = -110.5
 
 
 def northern_og_forest_type(fldtypcd: int | float) -> str | None:
@@ -67,6 +73,7 @@ def northern_subregion(
     state_abbrev: str | None,
     *,
     mt_east_of_continental_divide: bool | None,
+    plot_lon: float | None = None,
 ) -> str | None:
     """
     Northern MOG sub-zone: Idaho / western MT / eastern MT (+ plains states east of divide).
@@ -75,8 +82,13 @@ def northern_subregion(
     eastern vs western using ``nrow(...) > 1`` and ``< 1``. For a single-geometry
     plot, :func:`fia_mog.auxiliary.montana_plot_in_cont_divide_east` uses
     **intersects** and sets this flag to ``True`` when the plot lies in that
-    polygon (eastern Montana zone). If ``None`` for MT, habitat-based OG is
-    skipped; maturity indices still run.
+    polygon (eastern Montana zone).
+
+    If ``mt_east_of_continental_divide`` is ``None`` (shapefile missing, geopandas
+    unavailable, or divide disabled) but ``plot_lon`` is set, a **longitude
+    heuristic** (:data:`_MT_LON_HEURISTIC_EASTERN_IF_GTE`) assigns east vs west so
+    habitat OG rules can still run. Without either, Montana returns ``None`` and
+    habitat OG vectors stay empty.
     """
 
     if not state_abbrev:
@@ -87,9 +99,17 @@ def northern_subregion(
     if st in {"WY", "SD", "ND"}:
         return "eastern Montana zone"
     if st == "MT":
-        if mt_east_of_continental_divide is True:
+        mt_east = mt_east_of_continental_divide
+        if mt_east is None and plot_lon is not None:
+            try:
+                lon = float(plot_lon)
+                if math.isfinite(lon):
+                    mt_east = lon >= _MT_LON_HEURISTIC_EASTERN_IF_GTE
+            except (TypeError, ValueError):
+                pass
+        if mt_east is True:
             return "eastern Montana zone"
-        if mt_east_of_continental_divide is False:
+        if mt_east is False:
             return "western Montana zone"
         return None
     return None
@@ -267,3 +287,241 @@ def northern_habitat_letters(subregion: str | None, veg_code: str | None) -> lis
     if subregion == "eastern Montana zone":
         return east_mt_habitat_letters(veg_code)
     return []
+
+
+# PLANTS 4-letter prefix (dominant live-tree BA) → Green et al. northern OG forest-type label.
+# Only species that plausibly map to a published habitat OG rule set; unlisted / aspen → no inference.
+_NORTHERN_PLANTS_PREFIX_OG: dict[str, str] = {
+    "PSME": "DF",
+    "TSME": "DF",
+    "TSHE": "DF",
+    "THPL": "DF",
+    "ABGR": "DF",
+    "PIPO": "PP",
+    "PIED": "PP",
+    "PIPU": "PP",
+    "PIEN": "LP",
+    "PIAB": "LP",
+    "PIBR": "LP",
+    "PIGL": "LP",
+    "PIMA": "LP",
+    "PIRU": "LP",
+    "PISI": "LP",
+    "PIOM": "LP",
+    "PIFL": "LP",
+    "LALA": "LP",
+    "LAOC": "LP",
+    "LALY": "LP",
+    "ABLA": "LP",
+    "ABLO": "LP",
+    "PICO": "SAF",
+    "ABCO": "GF",
+    "ABMA": "GF",
+    "PIAL": "WBP",
+    "PIAR": "WBP",
+    "THOC": "C",
+    "JUOC": "C",
+    "JUSC": "C",
+}
+
+
+def _code_matches_tree_base(code: str, base: str) -> bool:
+    """True if a zone veg.code string refers to the given 4-letter overstory prefix."""
+
+    b = base.strip().upper()
+    if not b:
+        return False
+    cu = str(code).strip().upper()
+    if cu == b or cu.startswith(b + "/") or cu.startswith(b + "-"):
+        return True
+    if cu.endswith("-" + b):
+        return True
+    first = cu.split("-", 1)[0]
+    return first == b
+
+
+def northern_ba_dominant_plants_prefix(
+    trees: pd.DataFrame,
+    species_lookup: pd.DataFrame | None,
+) -> str | None:
+    """
+    Dominant overstory PLANTS prefix by **sum of basal area** on live trees (DIA ≥ 1 in, STATUSCD 1).
+
+    Used when ``FLDTYPCD`` does not map to a northern OG forest type but composition still
+    matches a Green et al. habitat rule group.
+    """
+
+    if trees is None or len(trees) == 0:
+        return None
+    norm = _normalize_species_lookup(species_lookup)
+    if norm is None:
+        return None
+    fia_lu, plants_lu = norm
+    t = trees.copy()
+    t["SPCD"] = pd.to_numeric(t.get("SPCD"), errors="coerce")
+    t["STATUSCD"] = pd.to_numeric(t.get("STATUSCD"), errors="coerce")
+    t["DIA"] = pd.to_numeric(t.get("DIA"), errors="coerce")
+    sub = t[(t["STATUSCD"] == 1) & (t["DIA"] >= 1)]
+    if sub.empty or "SPCD" not in sub.columns:
+        return None
+    ba = _basal_area(sub["DIA"])
+    sub = sub.assign(_ba=ba)
+    by_sp = sub.groupby("SPCD", dropna=True)["_ba"].sum()
+    if by_sp.empty:
+        return None
+    dom_spcd = float(by_sp.idxmax())
+    m = pd.to_numeric(fia_lu, errors="coerce") == dom_spcd
+    if not m.any():
+        return None
+    raw = plants_lu[m].iloc[0]
+    if raw is None or pd.isna(raw) or str(raw).lower() in {"nan", "none"}:
+        return None
+    s = str(raw).strip().upper()
+    return s[:4] if len(s) >= 4 else s
+
+
+def infer_northern_og_type_from_species(
+    trees: pd.DataFrame,
+    species_lookup: pd.DataFrame | None,
+) -> str | None:
+    """Infer ``northern_og_forest_type`` label from BA-dominant species when ``FLDTYPCD`` is unmapped."""
+
+    pfx = northern_ba_dominant_plants_prefix(trees, species_lookup)
+    if not pfx:
+        return None
+    key = pfx[:4] if len(pfx) >= 4 else pfx
+    return _NORTHERN_PLANTS_PREFIX_OG.get(key)
+
+
+def _northern_habitat_rules_for_subregion(
+    subregion: str | None,
+) -> list[tuple[str, frozenset[str]]] | None:
+    if subregion == "northern Idaho zone":
+        from .veg_idaho import IDAHO_RULES
+
+        return IDAHO_RULES
+    if subregion == "western Montana zone":
+        from .veg_west_mt import WEST_MT_RULES
+
+        return WEST_MT_RULES
+    if subregion == "eastern Montana zone":
+        from .veg_east_mt import EAST_MT_RULES
+
+        return EAST_MT_RULES
+    return None
+
+
+def fallback_northern_habitat_letters(
+    subregion: str | None,
+    veg_code: str | None,
+    trees: pd.DataFrame,
+    species_lookup: pd.DataFrame | None,
+) -> list[str]:
+    """
+    When the exact ``veg_code`` is absent from the zone table, match **overstory prefix**
+    (and understory prefix when present) against rule codes so habitat OG blocks can still run.
+
+    Tries understory-constrained matches first, then relaxes to overstory-only.
+    """
+
+    rules = _northern_habitat_rules_for_subregion(subregion)
+    if not rules:
+        return []
+
+    base = ""
+    und_u = ""
+    if veg_code and str(veg_code).strip():
+        parts = str(veg_code).strip().upper().split("/", 1)
+        base = parts[0].strip()[:4]
+        und_u = (parts[1].strip()[:4] if len(parts) > 1 else "") or ""
+    if not base:
+        dp = northern_dominant_tree_plants_prefix(trees, species_lookup)
+        base = (dp or "").strip().upper()[:4]
+    if not base:
+        ba_p = northern_ba_dominant_plants_prefix(trees, species_lookup)
+        base = (ba_p or "").strip().upper()[:4]
+    if not base:
+        return []
+
+    def collect(require_understory_match: bool) -> set[str]:
+        out: set[str] = set()
+        for letter, codeset in rules:
+            for code in codeset:
+                cu = str(code).strip().upper()
+                if require_understory_match and und_u:
+                    if "/" not in cu:
+                        continue
+                    pref, _, suff = cu.partition("/")
+                    pref = pref.strip()
+                    suff = suff.strip()
+                    if pref[:4] != base:
+                        continue
+                    if suff.startswith(und_u) or suff[:4] == und_u:
+                        out.add(letter)
+                        break
+                elif not require_understory_match:
+                    if _code_matches_tree_base(cu, base):
+                        out.add(letter)
+                        break
+        return out
+
+    if und_u:
+        s1 = collect(require_understory_match=True)
+        if s1:
+            return sorted(s1)
+    s2 = collect(require_understory_match=False)
+    return sorted(s2)
+
+
+# Western MT: approximate subalpine break (feet) to narrow broad prefix matches.
+_NORTHERN_WEST_MT_UPPER_ELEV_FT = 6500.0
+
+
+def refine_habitat_letters_environmental(
+    subregion: str | None,
+    letters: list[str],
+    *,
+    siteclcd: float | None,
+    elev_ft: float | None,
+) -> list[str]:
+    """
+    When prefix fallback returns many letters, narrow using coarse FIA site class and elevation.
+
+    Site class follows FIA ``SITECLCD`` (1 = lowest productivity, 6 = highest). Elevation uses
+    plot feet above sea level (``PLOT.ELEV``). Heuristics apply only to Montana zones.
+    """
+
+    if len(letters) <= 2:
+        return letters
+    uniq = sorted(set(letters))
+    out = list(uniq)
+
+    if subregion == "western Montana zone" and elev_ft is not None and not pd.isna(elev_ft):
+        try:
+            e = float(elev_ft)
+        except (TypeError, ValueError):
+            e = None
+        if e is not None and e >= _NORTHERN_WEST_MT_UPPER_ELEV_FT:
+            upper = {"E", "F", "G", "H", "I"}
+            hit = [L for L in out if L in upper]
+            if hit:
+                out = hit
+
+    if siteclcd is not None and not pd.isna(siteclcd):
+        try:
+            sc = int(float(siteclcd))
+        except (TypeError, ValueError):
+            return sorted(set(out))
+        if subregion in ("western Montana zone", "eastern Montana zone"):
+            if sc <= 2:
+                dry = {"A", "B", "C"}
+                hit = [L for L in out if L in dry]
+                if hit:
+                    out = hit
+            elif sc >= 5:
+                mesic = {"D", "E", "F", "G", "H", "I", "J"}
+                hit = [L for L in out if L in mesic]
+                if hit:
+                    out = hit
+
+    return sorted(set(out))

@@ -2,25 +2,12 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass
-from typing import Iterable, List, Mapping, Sequence
+from typing import Iterable, List, Mapping, Optional, Sequence
 
 import numpy as np
 import pandas as pd
 
-from .crosswalk import (
-    intermountain_type,
-    northern_basal_area_per_acre,
-    northern_habitat_letters,
-    northern_og_forest_type,
-    northern_subregion,
-    northern_veg_code,
-    statecd_to_abbrev,
-)
-from .northern.og_dispatch import (
-    northern_east_mt_og_vector,
-    northern_idaho_og_vector,
-    northern_west_mt_og_vector,
-)
+from .crosswalk import intermountain_type
 
 
 @dataclass(frozen=True)
@@ -61,6 +48,10 @@ class ConditionContext:
     pnw_woody_debris: pd.DataFrame | None = None
     pnw_site_class_max: float | None = None
     pnw_plot_in_or_counties_layer: bool | None = None
+    # Northern Region: plot elevation (feet), from PLOT.ELEV when available — refines habitat-letter fallback.
+    plot_elev_ft: float | None = None
+    # Plot longitude (degrees), from PLOT.LON — Montana east/west MOG zone if divide polygon is unavailable.
+    plot_lon: float | None = None
 
 
 @dataclass(frozen=True)
@@ -211,6 +202,14 @@ class RegionEvaluator:
     def mog_vector(self, ctx: ConditionContext, metrics: TreeMetrics) -> List[float]:
         raise NotImplementedError
 
+    def old_growth_flag(self, ctx: ConditionContext, metrics: Optional[TreeMetrics]) -> float:
+        """
+        Binary old growth for ``OG_PROP`` / ``old_growth_area`` — **Table 9 / 11 / 12 /
+        13–14 style rules only**. Table 19 maturity scores must not set this to 1.
+        """
+
+        raise NotImplementedError
+
 
 def _in_any(code: int, groups: Sequence[Iterable[int]]) -> bool:
     return any(code in g for g in groups)
@@ -315,10 +314,8 @@ class EasternEvaluator(RegionEvaluator):
         ),
     ]
 
-    def mog_vector(self, ctx: ConditionContext, metrics: TreeMetrics) -> List[float]:
+    def _eastern_og_scores(self, ctx: ConditionContext) -> List[float]:
         vec: List[float] = []
-
-        # Old growth: specific rules, else default "all other forest types"
         matched_any = False
         for groups, age_thr, dia_thr, dens_thr in self._og_rules:
             if _in_any(ctx.forest_type, groups):
@@ -329,9 +326,16 @@ class EasternEvaluator(RegionEvaluator):
                 vec.append(float(status))
 
         if not matched_any:
-            # R "all other forest types"
             status = self._evaluate_age_large_tree_og(ctx=ctx, age_thr=100, dia_thr=14, dens_thr=10)
             vec.append(float(status))
+        return vec
+
+    def old_growth_flag(self, ctx: ConditionContext, metrics: Optional[TreeMetrics]) -> float:
+        og = self._eastern_og_scores(ctx)
+        return 1.0 if max(og, default=0.0) >= 1.0 else 0.0
+
+    def mog_vector(self, ctx: ConditionContext, metrics: TreeMetrics) -> List[float]:
+        vec = self._eastern_og_scores(ctx)
 
         if max(vec, default=0.0) >= 1.0:
             return vec
@@ -508,6 +512,18 @@ class SouthernEvaluator(RegionEvaluator):
                         vec.append(float(_weighted_index(metrics, contributions)))
         return vec
 
+    def old_growth_flag(self, ctx: ConditionContext, metrics: Optional[TreeMetrics]) -> float:
+        if metrics is None:
+            return 0.0
+        southern_types = self._southern_types_for(ctx.forest_type)
+        if not southern_types:
+            return 0.0
+        if any(
+            self._eval_southern_og(ctx=ctx, metrics=metrics, southern_type=st) == 1 for st in southern_types
+        ):
+            return 1.0
+        return 0.0
+
     def _southern_types_for(self, forest_type: int) -> List[int]:
         out: List[int] = []
         for codes, types in self._crosswalk:
@@ -540,7 +556,7 @@ class SouthernEvaluator(RegionEvaluator):
 class RockyEvaluator(RegionEvaluator):
     region = "rocky"
 
-    def mog_vector(self, ctx: ConditionContext, metrics: TreeMetrics) -> List[float]:
+    def _rocky_og_scores(self, ctx: ConditionContext) -> List[float]:
         vec: List[float] = []
 
         trees = ctx.trees.copy()
@@ -556,9 +572,7 @@ class RockyEvaluator(RegionEvaluator):
         )
         n_dead_10 = float(len(trees.loc[(trees["DIA"] >= 10) & (trees["STATUSCD"] == 2), :]) / ctx.condition_area_acres)
 
-        # Old growth, Table 8
-        og_done = False
-        og_done |= self._rocky_og(
+        self._rocky_og(
             vec=vec,
             ctx=ctx,
             trees=trees,
@@ -571,7 +585,7 @@ class RockyEvaluator(RegionEvaluator):
             n_trees_broken=n_trees_broken,
             n_dead=n_dead_10,
         )
-        og_done |= self._rocky_og(
+        self._rocky_og(
             vec=vec,
             ctx=ctx,
             trees=trees,
@@ -584,7 +598,7 @@ class RockyEvaluator(RegionEvaluator):
             n_trees_broken=n_trees_broken,
             n_dead=n_dead_10,
         )
-        og_done |= self._rocky_og(
+        self._rocky_og(
             vec=vec,
             ctx=ctx,
             trees=trees,
@@ -597,7 +611,7 @@ class RockyEvaluator(RegionEvaluator):
             n_trees_broken=n_trees_broken,
             n_dead=n_dead_10,
         )
-        og_done |= self._rocky_og(
+        self._rocky_og(
             vec=vec,
             ctx=ctx,
             trees=trees,
@@ -610,7 +624,7 @@ class RockyEvaluator(RegionEvaluator):
             n_trees_broken=n_trees_broken,
             n_dead=n_dead_10,
         )
-        og_done |= self._rocky_og(
+        self._rocky_og(
             vec=vec,
             ctx=ctx,
             trees=trees,
@@ -623,7 +637,7 @@ class RockyEvaluator(RegionEvaluator):
             n_trees_broken=n_trees_broken,
             n_dead=n_dead_10,
         )
-        og_done |= self._rocky_og(
+        self._rocky_og(
             vec=vec,
             ctx=ctx,
             trees=trees,
@@ -636,7 +650,7 @@ class RockyEvaluator(RegionEvaluator):
             n_trees_broken=n_trees_broken,
             n_dead=n_dead_10,
         )
-        og_done |= self._rocky_og(
+        self._rocky_og(
             vec=vec,
             ctx=ctx,
             trees=trees,
@@ -649,6 +663,14 @@ class RockyEvaluator(RegionEvaluator):
             n_trees_broken=n_trees_broken,
             n_dead=n_dead_10,
         )
+        return vec
+
+    def old_growth_flag(self, ctx: ConditionContext, metrics: Optional[TreeMetrics]) -> float:
+        og = self._rocky_og_scores(ctx)
+        return 1.0 if max(og, default=0.0) >= 1.0 else 0.0
+
+    def mog_vector(self, ctx: ConditionContext, metrics: TreeMetrics) -> List[float]:
+        vec = self._rocky_og_scores(ctx)
 
         if max(vec, default=0.0) >= 1.0:
             return vec
@@ -807,8 +829,7 @@ class _IntermountainEvaluator(RegionEvaluator):
 
     region = "intermountain"
 
-    def mog_vector(self, ctx: ConditionContext, metrics: TreeMetrics) -> List[float]:
-        # Derive intermountain.type using the R crosswalk logic.
+    def _intermountain_og_scores(self, ctx: ConditionContext) -> List[float]:
         t = intermountain_type(
             statecd=ctx.plot_statecd or 0,
             fortypcd=ctx.condition_fortypcd or ctx.forest_type,
@@ -823,9 +844,6 @@ class _IntermountainEvaluator(RegionEvaluator):
 
         vec: List[float] = []
 
-        # Old-growth thresholds (Table 11) – ported as simple if/else using
-        # the same labels as the R code. Only a subset is shown here; the
-        # structure matches the others and can be extended as needed.
         if t in (
             "engelmann spruce - subalpine fir - warm - UT",
             "engelmann spruce - subalpine fir - warm - ID",
@@ -836,11 +854,18 @@ class _IntermountainEvaluator(RegionEvaluator):
             dens = float(len(large) / ctx.condition_area_acres) if len(large) else 0.0
             vec.append(1.0 if dens >= 25 else 0.0)
 
+        return vec
+
+    def old_growth_flag(self, ctx: ConditionContext, metrics: Optional[TreeMetrics]) -> float:
+        og = self._intermountain_og_scores(ctx)
+        return 1.0 if max(og, default=0.0) >= 1.0 else 0.0
+
+    def mog_vector(self, ctx: ConditionContext, metrics: TreeMetrics) -> List[float]:
         # Mature: use the same metric-threshold-weight pattern as other regions.
         # This is intentionally minimal; for most applications, northern / rocky /
         # southwest / coastal rules are more critical, and users can extend
         # intermountain rules locally following the same pattern.
-        return vec
+        return self._intermountain_og_scores(ctx)
 
 
 class _NorthernEvaluator(RegionEvaluator):
@@ -851,66 +876,35 @@ class _NorthernEvaluator(RegionEvaluator):
     (P2VEG_SUBPLOT_SPP) on `ConditionContext` when habitat-based OG scoring is
     required. For Montana, set `northern_mt_east_of_divide` from a spatial join;
     if it is None, habitat OG is skipped for MT (maturity indices still run).
+
+    Habitat 0/1 scores and species-inferred / letter-fallback logic live in
+    :func:`fia_mog.northern.diagnostics.compute_northern_habitat_og_bundle`.
+    Both :meth:`old_growth_flag` and the leading segment of :meth:`mog_vector`
+    use that bundle. Binary **old growth** for ``OG_PROP`` is ``max(habitat
+    scores) >= 1`` only (Table 19 maturity is excluded from the flag).
     """
 
     region = "northern"
 
+    def _northern_habitat_og_bundle(self, ctx: ConditionContext):
+        from .northern.diagnostics import compute_northern_habitat_og_bundle
+
+        return compute_northern_habitat_og_bundle(ctx)
+
+    def _northern_habitat_og_scores(self, ctx: ConditionContext) -> List[float]:
+        return list(self._northern_habitat_og_bundle(ctx).og_scores)
+
+    def old_growth_flag(self, ctx: ConditionContext, metrics: Optional[TreeMetrics]) -> float:
+        og = self._northern_habitat_og_scores(ctx)
+        return 1.0 if og and max(og) >= 1.0 else 0.0
+
     def mog_vector(self, ctx: ConditionContext, metrics: TreeMetrics) -> List[float]:
-        vec: List[float] = []
+        b = self._northern_habitat_og_bundle(ctx)
+        vec = list(b.og_scores)
         ft = int(ctx.forest_type)
-        og = northern_og_forest_type(ft)
-        st = statecd_to_abbrev(ctx.plot_statecd)
-        sub = northern_subregion(
-            st,
-            mt_east_of_continental_divide=ctx.northern_mt_east_of_divide,
-        )
-
-        basal = northern_basal_area_per_acre(ctx.trees, ctx.condition_area_acres)
-        plt_cn = ctx.trees["PLT_CN"].iloc[0] if "PLT_CN" in ctx.trees.columns else None
-        condid = ctx.trees["CONDID"].iloc[0] if "CONDID" in ctx.trees.columns else None
-
-        veg_code = northern_veg_code(
-            ctx.trees,
-            ctx.northern_species_lookup,
-            ctx.northern_veg_subplot,
-            plt_cn,
-            condid,
-        )
-        letters = northern_habitat_letters(sub, veg_code)
-
-        if sub == "northern Idaho zone":
-            vec.extend(
-                northern_idaho_og_vector(
-                    letters,
-                    og,
-                    raw_stand_age=ctx.stand_age,
-                    basal_area_per_acre=basal,
-                    condition_area_acres=ctx.condition_area_acres,
-                    trees=ctx.trees,
-                )
-            )
-        elif sub == "western Montana zone":
-            vec.extend(
-                northern_west_mt_og_vector(
-                    letters,
-                    og,
-                    raw_stand_age=ctx.stand_age,
-                    basal_area_per_acre=basal,
-                    condition_area_acres=ctx.condition_area_acres,
-                    trees=ctx.trees,
-                )
-            )
-        elif sub == "eastern Montana zone":
-            vec.extend(
-                northern_east_mt_og_vector(
-                    letters,
-                    og,
-                    raw_stand_age=ctx.stand_age,
-                    basal_area_per_acre=basal,
-                    condition_area_acres=ctx.condition_area_acres,
-                    trees=ctx.trees,
-                )
-            )
+        # Table 19 maturity: use resolved OG type (FLDTYPCD map + species inference),
+        # not ``northern_og_forest_type(ft)`` alone, so this matches habitat dispatch.
+        og = b.og_forest_type
 
         # Mature (Table 19): Northern always appends these component scores in R.
         if og == "DF" or ft in set(range(200, 204)):
@@ -1051,6 +1045,20 @@ class _SouthwestEvaluator(RegionEvaluator):
 
         return southwest_mog_vector(ctx, metrics)
 
+    def old_growth_flag(self, ctx: ConditionContext, metrics: Optional[TreeMetrics]) -> float:
+        from .southwest.evaluate import (
+            _resolve_southwest_eru,
+            _southwest_relative_sdi_and_qmd,
+            _southwest_table9_family_rule_og,
+        )
+
+        eru = _resolve_southwest_eru(ctx)
+        if not eru:
+            return 0.0
+        rsdi, sqmd, _ = _southwest_relative_sdi_and_qmd(ctx)
+        _fam, _rule, og = _southwest_table9_family_rule_og(rsdi, sqmd, eru)
+        return 1.0 if og == 1 else 0.0
+
 
 class _PacificSouthwestEvaluator(RegionEvaluator):
     """
@@ -1066,6 +1074,12 @@ class _PacificSouthwestEvaluator(RegionEvaluator):
         from .psw.evaluate import psw_mog_vector
 
         return psw_mog_vector(ctx, metrics)
+
+    def old_growth_flag(self, ctx: ConditionContext, metrics: Optional[TreeMetrics]) -> float:
+        from .psw.evaluate import pacific_southwest_og_vector
+
+        og = pacific_southwest_og_vector(ctx)
+        return 1.0 if og and max(og) >= 1.0 else 0.0
 
 
 class _PacificNorthwestEvaluator(RegionEvaluator):
@@ -1084,6 +1098,14 @@ class _PacificNorthwestEvaluator(RegionEvaluator):
         if ctx.pnw_inside_nwfp is None:
             return []
         return pacific_northwest_mog_vector(ctx, metrics)
+
+    def old_growth_flag(self, ctx: ConditionContext, metrics: Optional[TreeMetrics]) -> float:
+        from .pnw.evaluate import pacific_northwest_og_vector
+
+        if ctx.pnw_inside_nwfp is None:
+            return 0.0
+        og = pacific_northwest_og_vector(ctx)
+        return 1.0 if og and max(og) >= 1.0 else 0.0
 
 
 class MOGEngine:
@@ -1119,6 +1141,18 @@ class MOGEngine:
         if evaluator is None:
             return []
         return evaluator.mog_vector(ctx, metrics)
+
+    def old_growth_flag(self, ctx: ConditionContext) -> float:
+        """
+        Strict binary old growth for ``OG_PROP`` / area: **regional OG tables only**,
+        never Table 19 maturity (even if ``max(mog_vector)==1`` from maturity).
+        """
+
+        evaluator = self._evaluators.get(ctx.region)
+        if evaluator is None:
+            return 0.0
+        metrics = compute_tree_metrics(ctx)
+        return float(evaluator.old_growth_flag(ctx, metrics))
 
 
 def _weighted_index(metrics: TreeMetrics, contributions: Sequence[tuple[str, str, float, float]]) -> float:
