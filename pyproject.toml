@@ -6,12 +6,33 @@ build-backend = "setuptools.build_meta"
 name = "fia_py"
 version = "0.1.0"
 description = "Python port of the rFIA package for working with the USFS Forest Inventory and Analysis (FIA) database."
-authors = [
-  { name = "Ported from rFIA"}
-]
 readme = "README.md"
+license = { text = "MIT" }
 requires-python = ">=3.9"
+authors = [
+  { name = "Kevin Barnett" },
+]
+keywords = [
+  "fia",
+  "forest-inventory",
+  "usfs",
+  "fia-database",
+  "rFIA",
+  "pyfia",
+]
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "Intended Audience :: Science/Research",
+  "License :: OSI Approved :: MIT License",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.9",
+  "Programming Language :: Python :: 3.10",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Topic :: Scientific/Engineering",
+]
 dependencies = [
+  "numpy>=1.20",
   "pandas[pyarrow]>=1.5",
   "requests>=2.31",
   "tqdm>=4.66",
@@ -19,14 +40,20 @@ dependencies = [
   "rasterio>=1.3",
 ]
 
-[tool.setuptools]
-packages = ["fia", "fia_mog", "fia_mog.northern", "fia_mog.pnw", "fia_mog.psw", "fia_mog.southwest"]
+[project.optional-dependencies]
+dev = [
+  "pytest>=7.0",
+  "build>=1.0",
+]
 
 [project.urls]
 Homepage = "https://github.com/doserjef/rFIA"
+Repository = "https://github.com/doserjef/rFIA"
+
+[tool.setuptools.packages.find]
+where = ["."]
 
 [tool.pytest.ini_options]
 markers = [
-    "integration: needs network and/or FIADB-API (see tests/test_rfia_montana.py)",
+  "integration: needs network and/or FIADB-API (see tests/test_rfia_montana.py)",
 ]
-

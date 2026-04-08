@@ -11,13 +11,29 @@ The goal is to mirror the core public API of `rFIA` while adopting Pythonic conv
 - **`get_fia(..., load=False)`** removes downloaded **`.zip`** archives after extracting CSVs into **`dir`**, leaving a clean directory of tables.
 - **Old-growth / MOG** logic is implemented in the stand-alone **`fia_mog`** package (aligned with **`mog_auxillary/FUNCTION_mapMOG.R`**). **`mog_condition_scores`**, **`old_growth_area`**, and **`ConditionContext` / `MOGEngine`** remain importable from **`fia`** for compatibility; prefer **`fia_mog`** for new code.
 
-### Install (local, editable)
+### Install
 
-From the project root:
+**From a clone or sdist / wheel** (project root):
 
 ```bash
+pip install .
+# editable while developing:
 pip install -e .
 ```
+
+**Optional dev dependencies** (tests, building wheels):
+
+```bash
+pip install -e ".[dev]"
+```
+
+**After you publish to PyPI**, install with:
+
+```bash
+pip install fia_py
+```
+
+*(The distribution name on PyPI is **`fia_py`**; you still `import fia` and `import fia_mog` in code.)*
 
 Then in Python:
 

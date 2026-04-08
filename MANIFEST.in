@@ -1,0 +1,8 @@
+include LICENSE
+include README.md
+include pyproject.toml
+graft fia
+graft fia_mog
+global-exclude __pycache__
+global-exclude *.py[cod]
+global-exclude .DS_Store
