@@ -6,7 +6,11 @@ from typing import Callable, Iterable, List, Mapping, Optional, Sequence
 import numpy as np
 import pandas as pd
 
-from .data_io import FiaDatabase
+from .data_io import (
+    FiaDatabase,
+    ensure_plot_plt_cn,
+    normalize_fiadb_dataframe_columns,
+)
 from .design import handle_pops, ratio_var, combine_mr
 
 
@@ -115,6 +119,16 @@ def _ht_percentile_column_name(p: float) -> str:
     return f"HT_P{p:g}"
 
 
+def _normalize_plot_cond_tree_frames(
+    plot: pd.DataFrame, cond: pd.DataFrame, tree: pd.DataFrame
+) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    """Uppercase columns and ensure ``PLOT.PLT_CN`` for FIADB/SQLite compatibility."""
+    plot = ensure_plot_plt_cn(normalize_fiadb_dataframe_columns(plot))
+    cond = normalize_fiadb_dataframe_columns(cond)
+    tree = normalize_fiadb_dataframe_columns(tree)
+    return plot, cond, tree
+
+
 def area(
     db: FiaDatabase,
     grp_by: Optional[Sequence[str]] = None,
@@ -154,6 +168,8 @@ def area(
 
     plot = db["PLOT"].copy()
     cond = db["COND"].copy()
+    plot = ensure_plot_plt_cn(normalize_fiadb_dataframe_columns(plot))
+    cond = normalize_fiadb_dataframe_columns(cond)
 
     # Basic checks
     for col in ["PLT_CN", "INVYR", "PLOT_STATUS_CD"]:
@@ -1358,6 +1374,7 @@ def tpa(
     plot = db["PLOT"].copy()
     cond = db["COND"].copy()
     tree = db["TREE"].copy()
+    plot, cond, tree = _normalize_plot_cond_tree_frames(plot, cond, tree)
 
     # Basic checks for required columns
     for col in ["PLT_CN", "INVYR", "PLOT_STATUS_CD"]:
@@ -1857,6 +1874,7 @@ def cond_height_percentiles(
     plot = db["PLOT"].copy()
     cond = db["COND"].copy()
     tree = db["TREE"].copy()
+    plot, cond, tree = _normalize_plot_cond_tree_frames(plot, cond, tree)
 
     for col in ["PLT_CN", "INVYR", "PLOT_STATUS_CD"]:
         if col not in plot.columns:
@@ -1994,6 +2012,7 @@ def cond_mean_crown_ratio(
     plot = db["PLOT"].copy()
     cond = db["COND"].copy()
     tree = db["TREE"].copy()
+    plot, cond, tree = _normalize_plot_cond_tree_frames(plot, cond, tree)
 
     for col in ["PLT_CN", "INVYR", "PLOT_STATUS_CD"]:
         if col not in plot.columns:

@@ -4,7 +4,7 @@ from typing import Optional
 
 import pandas as pd
 
-from .data_io import FiaDatabase
+from .data_io import FiaDatabase, ensure_plot_plt_cn, normalize_fiadb_dataframe_columns
 
 
 def clip_fia(db: FiaDatabase, most_recent: bool = True) -> FiaDatabase:
@@ -43,8 +43,10 @@ def clip_fia(db: FiaDatabase, most_recent: bool = True) -> FiaDatabase:
     if not required_design.issubset(table_names):
         return db
 
-    # Work on copies of all tables
-    tables = {name: df.copy() for name, df in db.items()}
+    # Work on copies of all tables (uppercase columns for SQLite FIADB compatibility)
+    tables = {
+        name: normalize_fiadb_dataframe_columns(df.copy()) for name, df in db.items()
+    }
 
     pop_eval = tables["POP_EVAL"]
     ppsa = tables["POP_PLOT_STRATUM_ASSGN"]
@@ -92,16 +94,9 @@ def clip_fia(db: FiaDatabase, most_recent: bool = True) -> FiaDatabase:
     tables["POP_PLOT_STRATUM_ASSGN"] = ppsa_filtered
     valid_plots = ppsa_filtered["PLT_CN"].unique()
 
-    # Helper to ensure PLT_CN exists in PLOT
-    def _ensure_plt_cn(plot_df: pd.DataFrame) -> pd.DataFrame:
-        if "PLT_CN" not in plot_df.columns and "CN" in plot_df.columns:
-            plot_df = plot_df.copy()
-            plot_df["PLT_CN"] = plot_df["CN"]
-        return plot_df
-
     # Filter PLOT, TREE, COND, PLOTGEOM
     if "PLOT" in tables:
-        plot_df = _ensure_plt_cn(tables["PLOT"])
+        plot_df = ensure_plot_plt_cn(tables["PLOT"])
         tables["PLOT"] = plot_df[plot_df["PLT_CN"].isin(valid_plots)].copy()
 
     if "TREE" in tables and "PLT_CN" in tables["TREE"].columns:

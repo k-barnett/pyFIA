@@ -228,6 +228,29 @@ class FiaDatabase(Mapping[str, pd.DataFrame]):
         return self.tables.keys()
 
 
+def normalize_fiadb_dataframe_columns(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Uppercase all column names so SQLite FIADB and CSV exports share the same
+    identifiers (e.g. ``plt_cn`` → ``PLT_CN``).
+    """
+    out = df.copy()
+    out.columns = pd.Index([str(c).upper() for c in out.columns])
+    return out
+
+
+def ensure_plot_plt_cn(plot_df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Ensure ``PLOT`` has a ``PLT_CN`` column for joins with COND/TREE.
+
+    Official FIADB uses ``PLT_CN``; some SQLite extracts only expose ``CN`` as
+    the plot control number (same value). :func:`clip_fia` applies the same rule.
+    """
+    plot_df = plot_df.copy()
+    if "PLT_CN" not in plot_df.columns and "CN" in plot_df.columns:
+        plot_df["PLT_CN"] = plot_df["CN"]
+    return plot_df
+
+
 def _ensure_dir(path: Path) -> None:
     """
     Ensure ``path`` exists as a directory, creating it (and parents) if needed.
@@ -448,6 +471,7 @@ def _read_fia_sqlite(
             real = by_upper[logical]
             q = _sqlite_quote_ident(real)
             df = pd.read_sql_query(f"SELECT * FROM {q}", conn, dtype_backend="pyarrow")
+            df = normalize_fiadb_dataframe_columns(df)
             if logical in tables_dict:
                 tables_dict[logical] = pd.concat(
                     [tables_dict[logical], df], ignore_index=True

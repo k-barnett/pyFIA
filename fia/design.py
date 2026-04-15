@@ -4,7 +4,7 @@ from typing import Iterable, List, Sequence
 
 import pandas as pd
 
-from .data_io import FiaDatabase
+from .data_io import FiaDatabase, normalize_fiadb_dataframe_columns
 
 
 def combine_mr(df: pd.DataFrame, year_col: str = "YEAR") -> pd.DataFrame:
@@ -73,11 +73,13 @@ def get_design_info(
             + ", ".join(sorted(missing))
         )
 
-    pop_eval = db["POP_EVAL"].copy()
-    pop_eval_typ = db["POP_EVAL_TYP"].copy()
-    pop_estn_unit = db["POP_ESTN_UNIT"].copy()
-    pop_stratum = db["POP_STRATUM"].copy()
-    pop_plot_stratum = db["POP_PLOT_STRATUM_ASSGN"].copy()
+    pop_eval = normalize_fiadb_dataframe_columns(db["POP_EVAL"].copy())
+    pop_eval_typ = normalize_fiadb_dataframe_columns(db["POP_EVAL_TYP"].copy())
+    pop_estn_unit = normalize_fiadb_dataframe_columns(db["POP_ESTN_UNIT"].copy())
+    pop_stratum = normalize_fiadb_dataframe_columns(db["POP_STRATUM"].copy())
+    pop_plot_stratum = normalize_fiadb_dataframe_columns(
+        db["POP_PLOT_STRATUM_ASSGN"].copy()
+    )
 
     # Basic column checks (abbreviated)
     for col in ["CN", "STATECD", "END_INVYR", "EVALID", "ESTN_METHOD"]:
