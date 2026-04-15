@@ -105,6 +105,7 @@ tpa(
     by_species=False,
     by_size_class=None,
     by_plot=False,
+    by_cond=False,
     tree_list=False,
 )
 ```
@@ -114,6 +115,7 @@ tpa(
 - **`by_species=True`**: groups by species (**`SPECIES`** table when available; else **`SPCD`**).
 - **`by_size_class`**: ``None`` (default) skips diameter classes; otherwise a **non-empty list/tuple of inch breakpoints** (positive, strictly increasing). With *k* cutoffs you get **k + 1** half-open bins: ``[0, c0)``, ``[c0, c1)``, …, ``[c_{k-2}, c_{k-1})``, and a **final open-ended bin** ``[c_{k-1}, ∞)`` (trees at or above the largest cutoff go here). Column **`sizeClass`** uses pandas **`Interval`** labels. Example: ``(2, 4, 6, 8)`` → five bins: 0–2, 2–4, 4–6, 6–8, and 8–∞.
 - **`by_plot=True`**: per-plot **`TPA`**, **`BAA`**, **`PROP_FOREST`**.
+- **`by_cond=True`**: per **condition** (**`PLT_CN`**, **`CONDID`**, **`YEAR`**, optional **`grp_by`**) **`TPA`**, **`BAA`**, and condition-level **`PROP_FOREST`**. Do not set together with **`by_plot=True`**.
 - **`tree_list=True`**: per-tree rows with **`PLT_CN`**, **`CONDID`**, **`SUBP`**, **`TREE`**, **`YEAR`**, **`TPA`**, **`BAA`**, **`PROP_FOREST`** (and related columns as implemented).
 
 With POP design tables, uses a **TI design-based pipeline** (stratum → estimation unit → totals and variances): **`TPA`**, **`BAA`**, **`TREE_TOTAL`**, **`BA_TOTAL`**, **`AREA_TOTAL`**, variance / SE columns, and **`nPlots_*`**, **`N`**. Without POP tables, falls back to a simple plot-mean estimator.

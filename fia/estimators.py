@@ -1327,6 +1327,7 @@ def tpa(
     by_species: bool = False,
     by_size_class: Optional[Sequence[float]] = None,
     by_plot: bool = False,
+    by_cond: bool = False,
     tree_list: bool = False,
 ) -> pd.DataFrame:
     """
@@ -1344,6 +1345,14 @@ def tpa(
         are left-closed and right-open; ``sizeClass`` stores pandas
         ``Interval`` values. Example: ``(2, 4, 6, 8)`` → ``[0, 2)``,
         ``[2, 4)``, ``[4, 6)``, ``[6, 8)``, ``[8, inf)``.
+    by_plot:
+        If ``True``, return per-plot ``TPA``, ``BAA``, and plot-level ``PROP_FOREST``.
+    by_cond:
+        If ``True``, return per **condition** sums of ``TPA`` and ``BAA`` plus
+        ``PROP_FOREST`` for that condition (``CONDPROP_UNADJ × landD``), grouped by
+        ``PLT_CN``, ``CONDID``, ``YEAR``, and any ``grp_by`` columns. Same spirit
+        as ``by_plot=True`` but with condition-level aggregation. Incompatible with
+        ``by_plot=True``.
 
     Notes
     -----
@@ -1361,6 +1370,9 @@ def tpa(
     if grp_by is None:
         grp_by = []
     grp_by = list(grp_by)
+
+    if by_plot and by_cond:
+        raise ValueError("tpa: use at most one of by_plot=True or by_cond=True.")
 
     # Required tables
     required = {"PLOT", "COND", "TREE"}
@@ -1511,6 +1523,26 @@ def tpa(
             .merge(cond_area, on="PLT_CN", how="left")
         )
         return plot_level
+
+    if by_cond:
+        # Condition-level estimates: sum TPA/BAA per (PLT_CN, CONDID, YEAR, …)
+        grp_cols = [g for g in grp_by if g in tree_base.columns]
+        cond_area_by_cond = (
+            data[["PLT_CN", "CONDID", "CONDPROP_UNADJ", "aDI"]]
+            .drop_duplicates(subset=["PLT_CN", "CONDID"])
+            .assign(PROP_FOREST=lambda d: d["CONDPROP_UNADJ"] * d["aDI"])[
+                ["PLT_CN", "CONDID", "PROP_FOREST"]
+            ]
+        )
+        cond_level = (
+            tree_base.groupby(
+                ["PLT_CN", "CONDID", "YEAR"] + grp_cols,
+                as_index=False,
+            )[["TPA", "BAA"]]
+            .sum()
+            .merge(cond_area_by_cond, on=["PLT_CN", "CONDID"], how="left")
+        )
+        return cond_level
 
     # Tree‑level contributions within each plot for design-based estimator
     tree_plot = (
