@@ -6,7 +6,7 @@ import tempfile
 from contextlib import closing
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, Iterable, List, Mapping, Optional, Sequence, Set
+from typing import Dict, Iterable, List, Mapping, Optional, Sequence, Set, Tuple
 
 import pandas as pd
 import requests
@@ -201,6 +201,139 @@ ALL_STATES: List[str] = [
     "ENTIRE",
     "REF",
 ]
+
+# USPS / territory abbrev → FIA ``STATECD`` (plot-level filter for SQLite extracts).
+# Inverted from ``fia_mog.crosswalk.STATECD_TO_ST_ABBREV`` plus common extras.
+ST_ABBREV_TO_STATECD: Dict[str, int] = {
+    "AL": 1,
+    "AK": 2,
+    "AZ": 4,
+    "AR": 5,
+    "CA": 6,
+    "CO": 8,
+    "CT": 9,
+    "DE": 10,
+    "DC": 11,
+    "FL": 12,
+    "GA": 13,
+    "HI": 15,
+    "ID": 16,
+    "IL": 17,
+    "IN": 18,
+    "IA": 19,
+    "KS": 20,
+    "KY": 21,
+    "LA": 22,
+    "ME": 23,
+    "MD": 24,
+    "MA": 25,
+    "MI": 26,
+    "MN": 27,
+    "MS": 28,
+    "MO": 29,
+    "MT": 30,
+    "NE": 31,
+    "NV": 32,
+    "NH": 33,
+    "NJ": 34,
+    "NM": 35,
+    "NY": 36,
+    "NC": 37,
+    "ND": 38,
+    "OH": 39,
+    "OK": 40,
+    "OR": 41,
+    "PA": 42,
+    "RI": 44,
+    "SC": 45,
+    "SD": 46,
+    "TN": 47,
+    "TX": 48,
+    "UT": 49,
+    "VT": 50,
+    "VA": 51,
+    "WA": 53,
+    "WV": 54,
+    "WI": 55,
+    "WY": 56,
+    "AS": 60,
+    "FM": 64,
+    "GU": 66,
+    "MP": 69,
+    "PW": 70,
+    "PR": 72,
+    "VI": 78,
+}
+
+
+def _normalize_read_fia_states(
+    states: Optional[str | Sequence[str]],
+) -> Optional[Tuple[str, ...]]:
+    """
+    Validate and normalize ``states`` for :func:`read_fia`.
+
+    Returns ``None`` when no filter should be applied.
+    """
+    if states is None:
+        return None
+    if isinstance(states, str):
+        seq: Sequence[str] = [states]
+    else:
+        seq = list(states)
+    out = tuple(s.strip().upper() for s in seq if str(s).strip())
+    if not out:
+        return None
+    bad = [s for s in out if s not in ALL_STATES]
+    if bad:
+        raise ValueError(
+            "read_fia: unrecognized state(s): "
+            + ", ".join(bad)
+            + ". Use two-letter USPS-style codes (e.g. 'MT', 'AZ') or 'REF' / 'ENTIRE' where applicable."
+        )
+    return out
+
+
+def _csv_stem_state_prefix(stem: str) -> Optional[str]:
+    """Return the Datamart-style state prefix (e.g. ``MT``) or ``None`` if unprefixed."""
+    parts = stem.split("_", 1)
+    if len(parts) == 2 and len(parts[0]) in (2, 3):
+        return parts[0].upper()
+    return None
+
+
+def _sqlite_table_columns_upper(conn: sqlite3.Connection, table_real: str) -> Set[str]:
+    cur = conn.execute(f"PRAGMA table_info({_sqlite_quote_ident(table_real)})")
+    return {str(row[1]).upper() for row in cur.fetchall()}
+
+
+def _read_sqlite_chunked_pltcn(
+    conn: sqlite3.Connection,
+    quoted_table: str,
+    plt_cns: Sequence[int],
+    chunk_size: int = 500,
+) -> pd.DataFrame:
+    """Load rows with ``PLT_CN`` in ``plt_cns`` (SQLite parameter limit–safe)."""
+    ids = [int(x) for x in plt_cns]
+    if not ids:
+        probe = pd.read_sql_query(
+            f"SELECT * FROM {quoted_table} WHERE 0",
+            conn,
+            dtype_backend="pyarrow",
+        )
+        return probe.iloc[0:0]
+    frames: List[pd.DataFrame] = []
+    for i in range(0, len(ids), chunk_size):
+        chunk = ids[i : i + chunk_size]
+        ph = ",".join("?" * len(chunk))
+        frames.append(
+            pd.read_sql_query(
+                f"SELECT * FROM {quoted_table} WHERE PLT_CN IN ({ph})",
+                conn,
+                params=chunk,
+                dtype_backend="pyarrow",
+            )
+        )
+    return pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
 
 
 @dataclass
@@ -441,8 +574,22 @@ def _read_fia_sqlite(
     path: Path,
     tables: Optional[Sequence[str]],
     common: bool,
+    states: Optional[str | Sequence[str]] = None,
 ) -> FiaDatabase:
     """Load selected FIADB tables from a SQLite file into a :class:`FiaDatabase`."""
+    want_states_t = _normalize_read_fia_states(states)
+    geo_states = [s for s in (want_states_t or ()) if s not in ("REF", "ENTIRE")]
+    use_geo = bool(geo_states)
+    statecds: List[int] = []
+    if use_geo:
+        missing = [s for s in geo_states if s not in ST_ABBREV_TO_STATECD]
+        if missing:
+            raise ValueError(
+                "read_fia SQLite state filter: no FIA STATECD mapping for: "
+                + ", ".join(missing)
+            )
+        statecds = [ST_ABBREV_TO_STATECD[s] for s in geo_states]
+
     with closing(sqlite3.connect(str(path))) as conn:
         cur = conn.cursor()
         cur.execute(
@@ -464,13 +611,63 @@ def _read_fia_sqlite(
         else:
             wanted = set(by_upper.keys()).intersection({t.upper() for t in KNOWN_TABLES})
 
+        plot_filtered: Optional[pd.DataFrame] = None
+        plot_cn_ids: Optional[List[int]] = None
+        if use_geo:
+            if "PLOT" not in wanted:
+                raise ValueError(
+                    "read_fia(..., states=...) with a SQLite FIADB requires the PLOT table "
+                    "so rows can be restricted by STATECD. Add 'PLOT' to `tables` or use common=True."
+                )
+            real_plot = by_upper["PLOT"]
+            qplot = _sqlite_quote_ident(real_plot)
+            cols_p = _sqlite_table_columns_upper(conn, real_plot)
+            if "STATECD" not in cols_p:
+                raise ValueError(
+                    "read_fia(..., states=...): PLOT has no STATECD column in this database; "
+                    "use Datamart CSV extracts or a standard FIADB SQLite file."
+                )
+            ph_cd = ",".join("?" * len(statecds))
+            plot_filtered = pd.read_sql_query(
+                f"SELECT * FROM {qplot} WHERE STATECD IN ({ph_cd})",
+                conn,
+                params=statecds,
+                dtype_backend="pyarrow",
+            )
+            plot_filtered = normalize_fiadb_dataframe_columns(plot_filtered)
+            if "CN" in plot_filtered.columns:
+                ser = pd.to_numeric(plot_filtered["CN"], errors="coerce").dropna()
+            elif "PLT_CN" in plot_filtered.columns:
+                ser = pd.to_numeric(plot_filtered["PLT_CN"], errors="coerce").dropna()
+            else:
+                raise ValueError(
+                    "read_fia(..., states=...): PLOT has neither CN nor PLT_CN; cannot link TREE/COND."
+                )
+            plot_cn_ids = ser.astype("int64").tolist()
+
         tables_dict: Dict[str, pd.DataFrame] = {}
         for logical in sorted(wanted):
             if logical not in by_upper:
                 continue
             real = by_upper[logical]
             q = _sqlite_quote_ident(real)
-            df = pd.read_sql_query(f"SELECT * FROM {q}", conn, dtype_backend="pyarrow")
+            cols = _sqlite_table_columns_upper(conn, real)
+
+            if use_geo and logical == "PLOT":
+                df = plot_filtered  # type: ignore[assignment]
+            elif use_geo and "PLT_CN" in cols and logical != "PLOT":
+                df = _read_sqlite_chunked_pltcn(conn, q, plot_cn_ids or [])
+            elif use_geo and "STATECD" in cols:
+                ph = ",".join("?" * len(statecds))
+                df = pd.read_sql_query(
+                    f"SELECT * FROM {q} WHERE STATECD IN ({ph})",
+                    conn,
+                    params=statecds,
+                    dtype_backend="pyarrow",
+                )
+            else:
+                df = pd.read_sql_query(f"SELECT * FROM {q}", conn, dtype_backend="pyarrow")
+
             df = normalize_fiadb_dataframe_columns(df)
             if logical in tables_dict:
                 tables_dict[logical] = pd.concat(
@@ -486,6 +683,7 @@ def read_fia(
     dir: str,
     tables: Optional[Sequence[str]] = None,
     common: bool = True,
+    states: Optional[str | Sequence[str]] = None,
 ) -> FiaDatabase:
     """
     Read FIA data into a :class:`FiaDatabase` from CSV files or a SQLite FIADB.
@@ -505,6 +703,22 @@ def read_fia(
     common:
         If True and `tables` is None, load a common subset of frequently used
         tables (PLOT, TREE, COND, etc.), mirroring the R package behavior.
+    states:
+        Optional state / territory codes (e.g. ``"MT"`` or ``["AZ", "NM"]``).
+
+        **CSV directory:** only reads files whose Datamart prefix matches one of
+        the codes (e.g. ``MT_PLOT.csv`` when ``states=["MT"]``). Unprefixed
+        national files such as ``PLOT.csv`` are included only if ``"ENTIRE"``
+        appears in ``states``. Reference-style prefixes such as ``REF_SPECIES``
+        are included only if ``"REF"`` is listed.
+
+        **SQLite FIADB:** when you pass real geographic codes (not ``REF`` /
+        ``ENTIRE`` alone), loads **PLOT** rows with ``STATECD`` in the requested
+        states, then restricts other tables that have ``PLT_CN`` to those plot
+        control numbers (and applies ``STATECD`` filtering on tables that have
+        that column but not ``PLT_CN``). You must include **PLOT** in ``tables``
+        (or use ``common=True``). ``REF`` / ``ENTIRE`` do not apply row filtering
+        on SQLite; pass ``states=None`` to load the full file.
     """
 
     path = Path(dir).expanduser().absolute()
@@ -513,7 +727,7 @@ def read_fia(
 
     if path.is_file():
         try:
-            return _read_fia_sqlite(path, tables=tables, common=common)
+            return _read_fia_sqlite(path, tables=tables, common=common, states=states)
         except sqlite3.DatabaseError as e:
             raise ValueError(
                 f"Could not read SQLite FIADB at {path}: {e}"
@@ -521,6 +735,9 @@ def read_fia(
 
     if not path.is_dir():
         raise NotADirectoryError(f"Expected a directory or SQLite file: {path}")
+
+    want_states_t = _normalize_read_fia_states(states)
+    want_state_set: Optional[Set[str]] = set(want_states_t) if want_states_t else None
 
     csv_files = sorted(p for p in path.iterdir() if p.suffix.lower() == ".csv")
     if not csv_files:
@@ -554,8 +771,16 @@ def read_fia(
             logical = parts[1].upper()
         else:
             logical = stem.upper()
-        if logical in wanted:
-            selected_files.append(p)
+        if logical not in wanted:
+            continue
+        if want_state_set is not None:
+            pref = _csv_stem_state_prefix(stem)
+            if pref is None:
+                if "ENTIRE" not in want_state_set:
+                    continue
+            elif pref not in want_state_set:
+                continue
+        selected_files.append(p)
 
     tables_dict: Dict[str, pd.DataFrame] = {}
     for p in selected_files:

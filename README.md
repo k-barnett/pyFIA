@@ -70,9 +70,10 @@ from fia import (
   - When **`load=False`**, **`.zip`** files are deleted after extraction so **`dir`** contains only CSVs.
   - If the expected CSV for a requested state/table (e.g. **`AZ_PLOT.csv`**) already exists in **`dir`**, that table is **not** re-downloaded; **`get_fia`** prints a skip message. With **`load=True`**, it still loads from the existing file.
 
-- **`read_fia(dir, tables=None, common=True)`**
+- **`read_fia(dir, tables=None, common=True, states=None)`**
   - Reads into a **`FiaDatabase`** from either a **directory of CSVs** (Datamart-style names such as **`AZ_PLOT.csv`**) **or** a **SQLite FIADB file** path (e.g. **`.sqlite`** / **`.db`**). If **`dir`** points to a file, it is opened with **`sqlite3`**; table and view names are matched case-insensitively and stored under **uppercase** keys like **`PLOT`**, **`TREE`**. Column names in each loaded table are uppercased so they match CSV-style FIADB field names.
   - Supports selecting a specific list of tables (**`tables`**) or a common subset when **`common=True`** (similar to **`readFIA(..., common=TRUE)`** in R).
+  - Optional **`states`**: for **CSV** folders, only loads prefixed files for those codes (e.g. **`states=["MT"]`** reads **`MT_PLOT.csv`** but skips **`AZ_PLOT.csv`**); unprefixed national **`PLOT.csv`**-style files load only if **`"ENTIRE"`** is included; **`REF_SPECIES`**-style files require **`"REF"`**. For **SQLite**, filters **`PLOT`** by **`STATECD`** and child tables by **`PLT_CN`** / **`STATECD`** ( **`PLOT`** must be in **`tables`** or use **`common=True`** ).
 
 - **Unclipped FIADB and estimators**
   - **`tpa`**, **`area`**, **`cond_height_percentiles`**, **`cond_mean_crown_ratio`**, and design helpers normalize **`PLOT` / `COND` / `TREE`** columns (uppercase names; if **`PLOT`** has **`CN`** but not **`PLT_CN`**, **`PLT_CN`** is set from **`CN`**) so you can run them **without** calling **`clip_fia`** first. Clipping is still recommended when you want the **most recent evaluation** subset only.
